@@ -344,10 +344,17 @@ async fn with_timeout<T>(
 ///
 /// Async; must run on a Tokio runtime.
 pub async fn sync_table(config: &SyncConfig, table_sync: &TableSync) -> Result<TableSyncStats> {
-    let checkpoints = checkpoint::read_all(&config.checkpoint_uri).await?;
-    let last_value = checkpoints.get(&table_sync.table).cloned();
+    let last_value = checkpoint::read(&checkpoint_uri_for(config, &table_sync.table)?).await?;
     let mut client = connect::open(&config.connect).await?;
     sync_one(&mut client, config, table_sync, last_value).await
+}
+
+/// Where one configured table's checkpoint lives.
+fn checkpoint_uri_for(config: &SyncConfig, table: &str) -> Result<String> {
+    Ok(checkpoint::uri_for(
+        &config.checkpoint_uri,
+        &relative_path(table)?,
+    ))
 }
 
 /// The body of [`sync_table`], against an already-open client.
@@ -356,10 +363,8 @@ pub async fn sync_table(config: &SyncConfig, table_sync: &TableSync) -> Result<T
 /// in once per table: a run covering many tables otherwise pays a TDS login, and possibly
 /// a TLS handshake, for each one.
 ///
-/// `last_value` is this table's checkpoint, read by the caller rather than here. That is
-/// deliberate: the checkpoint table holds every table's row, so reading it once per run
-/// and indexing into it costs one Delta load, whereas reading it here would cost one per
-/// table synced.
+/// `last_value` is this table's checkpoint, read by the caller rather than here, so that
+/// a caller syncing many tables controls when those reads happen.
 async fn sync_one(
     client: &mut SqlClient,
     config: &SyncConfig,
@@ -500,7 +505,7 @@ async fn sync_one(
             .map(|d| d.as_micros() as i64)
             .unwrap_or(0);
         checkpoint::advance(
-            &config.checkpoint_uri,
+            &checkpoint_uri_for(config, &table_sync.table)?,
             &table_sync.table,
             &table_sync.watermark_column,
             &new_value,
@@ -583,10 +588,6 @@ pub fn run(
         })?;
 
     runtime.block_on(async {
-        // Once for the whole run, not once per table: every table's checkpoint lives in
-        // this one Delta table, so re-reading it per table would turn a fixed cost into a
-        // per-table one for no gain.
-        let checkpoints = checkpoint::read_all(&config.checkpoint_uri).await?;
         let mut client = connect::open(&config.connect).await?;
         let total_tables = catalog.tables().len();
         let mut report = SyncReport {
@@ -595,7 +596,13 @@ pub fn run(
         };
 
         for table_sync in catalog.tables() {
-            let last_value = checkpoints.get(&table_sync.table).cloned();
+            // Each table's checkpoint is its own tiny Delta table, read just before the
+            // table that needs it. One read per table is inherent to that layout, and is
+            // what buys the ability to sync tables from independent workers without any
+            // of them sharing a writer; see crate::checkpoint's module docs.
+            let last_value = checkpoint::read(&checkpoint_uri_for(config, &table_sync.table)?)
+                .await
+                .map_err(|e| e.in_table(&table_sync.table))?;
             // A run covers many tables, so every failure says which one it was.
             let stats = sync_one(&mut client, config, table_sync, last_value)
                 .await
@@ -698,15 +705,6 @@ pub fn preflight(config: &SyncConfig, catalog: &SyncCatalog) -> Result<Vec<Table
     }
 
     runtime.block_on(async {
-        // An empty checkpoint_uri means the caller did not say where checkpoints live and
-        // does not want them reported. Deriving one from an empty output_uri would probe
-        // "/_streamer_checkpoints", an absolute path at the filesystem root, which is
-        // nonsense that only looks harmless because a failed load reads back as empty.
-        let checkpoints = if config.checkpoint_uri.is_empty() {
-            std::collections::HashMap::new()
-        } else {
-            checkpoint::read_all(&config.checkpoint_uri).await?
-        };
         let mut client = connect::open(&config.connect).await?;
         let mut out = Vec::with_capacity(catalog.tables().len());
 
@@ -733,7 +731,17 @@ pub fn preflight(config: &SyncConfig, catalog: &SyncCatalog) -> Result<Vec<Table
                     .filter(|key| !has(key))
                     .cloned()
                     .collect(),
-                last_synced_value: checkpoints.get(&table_sync.table).cloned(),
+                // An empty checkpoint_uri means the caller did not say where checkpoints
+                // live and does not want them reported. Deriving one from an empty
+                // output_uri would probe an absolute path at the filesystem root, which
+                // only looks harmless because a failed load reads back as empty.
+                last_synced_value: if config.checkpoint_uri.is_empty() {
+                    None
+                } else {
+                    checkpoint::read(&checkpoint_uri_for(config, &table_sync.table)?)
+                        .await
+                        .map_err(|e| e.in_table(&table_sync.table))?
+                },
                 columns: columns
                     .iter()
                     .map(|(name, rt)| ColumnPreflight {

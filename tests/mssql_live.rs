@@ -362,15 +362,15 @@ fn the_checkpoint_advances_to_the_greatest_watermark_seen() {
             .await
             .unwrap();
 
-        let checkpoints: HashMap<String, String> =
-            tiberiusdelta::checkpoint::read_all(&config.checkpoint_uri)
-                .await
-                .unwrap();
-        let recorded = checkpoints
-            .get("dbo.customers")
+        // Each table's checkpoint is its own Delta table, laid out to mirror the data:
+        // dbo.customers is checkpointed at <checkpoint_uri>/dbo/customers.
+        let at = tiberiusdelta::checkpoint::uri_for(&config.checkpoint_uri, "dbo/customers");
+        let recorded = tiberiusdelta::checkpoint::read(&at)
+            .await
+            .unwrap()
             .expect("a checkpoint must be recorded");
         assert_eq!(
-            recorded, &expected_max,
+            recorded, expected_max,
             "checkpoint should be the source's own greatest updated_at"
         );
     });
