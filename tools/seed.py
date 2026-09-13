@@ -47,12 +47,17 @@ def batches(script: str) -> list[str]:
     return [b for b in (b.strip() for b in out) if b]
 
 
-def connect(host: str, port: int, password: str, database: str = "master", attempts: int = 30):
+def connect(host: str, port: int, password: str, database: str = "master", attempts: int = 60):
     """Connect, waiting for the server to come up.
 
     A freshly started SQL Server container accepts TCP connections before it accepts
     logins, so a single attempt fails for reasons that are not a real error. Retries with
     a fixed delay rather than failing the job over a race with startup.
+
+    This is also why the CI service containers declare no health check: waiting here for a
+    successful *login* is a strictly later and more meaningful condition than any
+    connection-level probe, and it needs no shell quoting to get right. Two minutes of
+    patience covers a cold container image pull on a slow runner.
     """
     last = None
     for attempt in range(attempts):

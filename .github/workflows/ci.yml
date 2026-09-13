@@ -13,9 +13,16 @@ env:
   # which is right for the wheel and fatal for a test binary, so --all-features must not
   # be used anywhere a binary is linked.
   LIB_FEATURES: azure
-  # The throwaway password for the SQL Server service container below. Local to one CI
+  # The throwaway password for the SQL Server service containers below. Local to one CI
   # run, reachable only from inside that run's network, and granting nothing anywhere
-  # else; it is a fixture, not a secret.
+  # else; it is a fixture, not a secret. Repeated literally in each `services` block
+  # rather than read from this context, because whether the env context resolves there is
+  # version-dependent and an unresolved value would surface as a confusing login failure.
+  #
+  # The service containers deliberately declare no health check: tools/seed.py already
+  # waits for the server to accept *logins*, which is the condition that matters and is
+  # strictly later than accepting TCP connections. A health check would add a fragile
+  # shell-quoting surface and a dependency on sqlcmd's exact path inside the image.
   MSSQL_SA_PASSWORD: Test_Passw0rd!2026
 
 jobs:
@@ -38,9 +45,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --features "$LIB_FEATURES" -- -D warnings
 
-      # --lib and --doc only: the live tests need a database and run in their own job.
-      - name: Unit tests and doctests
-        run: cargo test --lib --doc --features "$LIB_FEATURES"
+      # Two steps, not one: cargo refuses to mix --doc with any other target selector.
+      # The live tests need a database and run in their own job.
+      - name: Unit tests
+        run: cargo test --lib --features "$LIB_FEATURES"
+
+      - name: Doctests
+        run: cargo test --doc --features "$LIB_FEATURES"
 
       - name: Documentation builds without broken links
         run: cargo doc --no-deps --features "$LIB_FEATURES"
@@ -58,15 +69,9 @@ jobs:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env:
           ACCEPT_EULA: "Y"
-          MSSQL_SA_PASSWORD: ${{ env.MSSQL_SA_PASSWORD }}
+          MSSQL_SA_PASSWORD: Test_Passw0rd!2026
         ports:
           - 14330:1433
-        options: >-
-          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 20
-          --health-start-period 30s
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -92,15 +97,9 @@ jobs:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env:
           ACCEPT_EULA: "Y"
-          MSSQL_SA_PASSWORD: ${{ env.MSSQL_SA_PASSWORD }}
+          MSSQL_SA_PASSWORD: Test_Passw0rd!2026
         ports:
           - 14330:1433
-        options: >-
-          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 20
-          --health-start-period 30s
     steps:
       - uses: actions/checkout@v4
 
@@ -170,15 +169,9 @@ jobs:
         image: mcr.microsoft.com/mssql/server:2022-latest
         env:
           ACCEPT_EULA: "Y"
-          MSSQL_SA_PASSWORD: ${{ env.MSSQL_SA_PASSWORD }}
+          MSSQL_SA_PASSWORD: Test_Passw0rd!2026
         ports:
           - 14330:1433
-        options: >-
-          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 20
-          --health-start-period 30s
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
