@@ -15,7 +15,9 @@ class TableConfig(TypedDict):
     """How one table is kept in sync."""
 
     table: str
-    """Qualified table name, exactly as the source names it, for example ``dbo.customers``."""
+    """Table name as the source names it, in one, two or three parts: ``customers``,
+    ``dbo.customers`` or ``appdb.dbo.customers``. Each part becomes a path component under
+    ``output_uri``. Brackets and whitespace are rejected rather than quoted."""
 
     watermark_column: str
     """Column filtered on: ``WHERE <watermark_column> > <last_synced_value>``. Must be
@@ -172,9 +174,10 @@ def sync_tables(
     :returns: A :class:`SyncReport`.
 
     :raises ConnectionError: The source could not be reached, or the login was refused.
-    :raises ValueError: The configuration is wrong: a missing watermark column or primary
-        key, a duplicate table, a name unsafe to interpolate into SQL, or a fetched value
-        that contradicts its column's declared type.
+    :raises ValueError: The configuration is wrong: a missing key in a table entry, a
+        missing watermark column or primary key, a duplicate table, a table that does not
+        exist or the account cannot see, a name unsafe to interpolate into SQL, or a
+        fetched value that contradicts its column's declared type.
     :raises RuntimeError: A Delta write, a checkpoint write, or an internal invariant
         failed.
     :raises KeyboardInterrupt: Ctrl-C was pressed between tables.
@@ -214,8 +217,9 @@ def preflight(
     :param connection_string: As for :func:`sync_tables`.
     :param tables: As for :func:`sync_tables`.
     :param output_uri: Only used to derive ``checkpoint_uri``. Pass the same value the
-        real sync would use to have ``last_synced_value`` reported; leave it empty to skip
-        reading checkpoints.
+        real sync would use to have ``last_synced_value`` reported; leave it empty and no
+        checkpoint table is read or derived at all, and every ``last_synced_value`` is
+        ``None``.
     :param checkpoint_uri: Where the checkpoint table lives, if not derived from
         ``output_uri``.
     :param login_timeout_sec: As for :func:`sync_tables`.

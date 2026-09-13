@@ -343,6 +343,7 @@ worse than running once.
 |---|---|---|
 | `ConnectionError` | Network path down, credentials rotated, instance restarting | Check reachability and the secret. Safe to retry |
 | `ValueError` mentioning a watermark column or primary key | Configuration does not match the source | Run `preflight`; a column was probably renamed or dropped |
+| `ValueError` saying a table does not exist or has no SELECT grant | The name is wrong, or the account lacks the grant | Check the name's spelling and part count, then the grant in Chapter III, Section 1 |
 | `ValueError` mentioning a value and a type | A schema change landed mid-run | Re-run. If persistent, `preflight` and reconcile the configuration |
 | `ValueError` mentioning an unsafe name | A configured name contains a quote, semicolon or backslash | Fix the configuration |
 | `RuntimeError` mentioning delta or checkpoint | Object-store failure or a commit conflict | Check storage permissions and whether two syncs ran concurrently. Safe to retry |

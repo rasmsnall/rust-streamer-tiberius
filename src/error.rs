@@ -39,6 +39,17 @@ pub enum Error {
         message: String,
     },
 
+    /// A configured table does not exist, or the connected account cannot see it.
+    ///
+    /// Its own variant rather than [`Error::Internal`], which would tell the caller this
+    /// crate has a defect when in fact their configuration names a table the source does
+    /// not have, or their account lacks the grant to see it. Those are the two things to
+    /// check, and the message says so.
+    TableNotFound {
+        /// Qualified table name, as configured.
+        table: String,
+    },
+
     /// A table is configured for incremental sync but is missing the configuration an
     /// incremental sync needs.
     ///
@@ -161,6 +172,10 @@ impl fmt::Display for Error {
         match self {
             Error::Connect { message } => write!(f, "connection error: {message}"),
             Error::Query { message } => write!(f, "query error: {message}"),
+            Error::TableNotFound { table } => write!(
+                f,
+                "table {table} does not exist, or this account has no SELECT grant on it"
+            ),
             Error::IncrementalConfigMissing { table, missing } => {
                 write!(
                     f,

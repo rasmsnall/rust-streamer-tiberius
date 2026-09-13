@@ -177,10 +177,19 @@ fn mutating_one_source_row_causes_only_that_row_to_resync() {
     let config = sync_config(uri(&dir));
 
     runtime().block_on(async {
+        // Watermarks are computed relative to what is already in the table rather than
+        // hardcoded. An absolute date silently breaks this test whenever anything else
+        // leaves behind a row with a later one (tools/smoke.py does exactly that): the
+        // checkpoint then sits ahead of this row, and the strictly-greater-than filter
+        // correctly excludes it, so the library looks wrong when it is right. This file's
+        // own contract is that every test stays correct regardless of inherited state,
+        // and hardcoding broke it.
         execute(
             "DELETE FROM dbo.customers WHERE id = 999; \
+             DECLARE @next DATETIME2 = \
+               DATEADD(day, 1, (SELECT MAX(updated_at) FROM dbo.customers)); \
              INSERT INTO dbo.customers (id, name, balance, is_active, updated_at) \
-             VALUES (999, N'Zed', 1.00, 1, '2026-05-01T00:00:00')",
+             VALUES (999, N'Zed', 1.00, 1, @next)",
         )
         .await;
 
@@ -190,8 +199,9 @@ fn mutating_one_source_row_causes_only_that_row_to_resync() {
         assert!(first.rows_fetched >= 1);
 
         execute(
-            "UPDATE dbo.customers SET balance = 555.55, updated_at = '2026-06-01T00:00:00' \
-             WHERE id = 999",
+            "DECLARE @next DATETIME2 = \
+               DATEADD(day, 1, (SELECT MAX(updated_at) FROM dbo.customers)); \
+             UPDATE dbo.customers SET balance = 555.55, updated_at = @next WHERE id = 999",
         )
         .await;
 

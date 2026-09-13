@@ -180,11 +180,20 @@ impl PyTablePreflight {
 /// writing `"id"` rather than `["id"]` is the obvious mistake to make and rejecting it
 /// would be pedantry rather than safety.
 fn build_catalog(tables: Vec<Bound<'_, PyAny>>) -> PyResult<SyncCatalog> {
+    // A missing key is a configuration error, and the documented surface promises
+    // ValueError for those. Letting `get_item`'s own KeyError through would contradict
+    // both __init__.pyi and docs/api.md.
+    fn required<'py>(entry: &Bound<'py, PyAny>, key: &str) -> PyResult<Bound<'py, PyAny>> {
+        entry.get_item(key).map_err(|_| {
+            PyValueError::new_err(format!("each table configuration needs a {key:?} key"))
+        })
+    }
+
     let mut entries = Vec::with_capacity(tables.len());
     for entry in tables {
-        let table: String = entry.get_item("table")?.extract()?;
-        let watermark_column: String = entry.get_item("watermark_column")?.extract()?;
-        let key = entry.get_item("primary_key")?;
+        let table: String = required(&entry, "table")?.extract()?;
+        let watermark_column: String = required(&entry, "watermark_column")?.extract()?;
+        let key = required(&entry, "primary_key")?;
         let primary_key: Vec<String> = match key.extract::<String>() {
             Ok(single) => vec![single],
             Err(_) => key.extract()?,
@@ -206,8 +215,16 @@ fn build_config(
     login_timeout_sec: Option<u64>,
     query_timeout_sec: Option<u64>,
 ) -> SyncConfig {
-    let checkpoint_uri = checkpoint_uri
-        .unwrap_or_else(|| format!("{}/_streamer_checkpoints", output_uri.trim_end_matches('/')));
+    // An empty output_uri with no explicit checkpoint_uri leaves the checkpoint URI
+    // empty too, which preflight reads as "do not report checkpoints". Deriving
+    // "/_streamer_checkpoints" from nothing would probe the filesystem root instead.
+    let checkpoint_uri = checkpoint_uri.unwrap_or_else(|| {
+        if output_uri.is_empty() {
+            String::new()
+        } else {
+            format!("{}/_streamer_checkpoints", output_uri.trim_end_matches('/'))
+        }
+    });
     SyncConfig {
         connect: ConnectConfig {
             connection_string,

@@ -81,7 +81,15 @@ pub struct TableSyncStats {
 /// [`Error::UnsafeTableName`] if `name` contains a quote, semicolon, or backslash, or is
 /// empty.
 fn validate_identifier(name: &str) -> Result<()> {
-    if name.is_empty() || name.contains(['\'', '"', ';', '\\', '\0']) {
+    // Whitespace and brackets are rejected, not because they are dangerous but because
+    // this crate does not bracket-quote what it interpolates, so `dbo.my table` would
+    // become invalid SQL and `[dbo].[customers]` would be looked up under a schema
+    // literally named `[dbo]`. Failing here names the real problem; failing later does
+    // not.
+    if name.is_empty()
+        || name.contains(['\'', '"', ';', '\\', '\0', '[', ']'])
+        || name.chars().any(char::is_whitespace)
+    {
         return Err(Error::UnsafeTableName {
             name: name.to_string(),
         });
@@ -98,25 +106,67 @@ fn validate_identifier(name: &str) -> Result<()> {
 ///
 /// # Errors
 ///
-/// [`Error::UnsafeTableName`] if a component is empty or is exactly `.` or `..`.
+/// [`Error::UnsafeTableName`] if a component is empty, is exactly `.` or `..`, or the
+/// name cannot be parsed into at most three safe parts.
 fn relative_path(table: &str) -> Result<String> {
-    validate_identifier(table)?;
-    let parts: Vec<&str> = table.split('.').collect();
-    for part in &parts {
-        if part.is_empty() || *part == "." || *part == ".." {
-            return Err(Error::UnsafeTableName {
-                name: table.to_string(),
-            });
-        }
-    }
-    Ok(parts.join("/"))
+    // Shares [`parse_qualified`]'s parsing rather than repeating it, so the path a table
+    // is written to and the catalog it is looked up in can never disagree about what its
+    // name means.
+    let parsed = parse_qualified(table)?;
+    let parts = [parsed.database, parsed.schema, Some(parsed.table)];
+    Ok(parts.into_iter().flatten().collect::<Vec<_>>().join("/"))
 }
 
-/// Splits `dbo.customers` into its schema and table halves; a bare name has no schema.
-fn split_qualified(table: &str) -> (Option<&str>, &str) {
-    match table.split_once('.') {
-        Some((schema, name)) => (Some(schema), name),
-        None => (None, table),
+/// One configured table name, split into the parts SQL Server names it by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QualifiedName<'a> {
+    /// Database, present only in a three-part name.
+    database: Option<&'a str>,
+    /// Schema, absent only in a bare one-part name.
+    schema: Option<&'a str>,
+    /// The table itself.
+    table: &'a str,
+}
+
+/// Splits a configured table name into database, schema and table.
+///
+/// SQL Server names a table by up to three parts, `database.schema.table`, and all three
+/// forms are ordinary in configuration. Splitting on the *first* separator, which an
+/// earlier version of this function did, silently mis-parses the three-part form into
+/// schema `database` and table `schema.table`, whose catalog lookup then finds nothing.
+///
+/// # Errors
+///
+/// [`Error::UnsafeTableName`] if the name has more than three parts, or any part is empty
+/// or is otherwise unsafe to interpolate.
+fn parse_qualified(name: &str) -> Result<QualifiedName<'_>> {
+    let unsafe_name = || Error::UnsafeTableName {
+        name: name.to_string(),
+    };
+    let parts: Vec<&str> = name.split('.').collect();
+    for part in &parts {
+        validate_identifier(part)?;
+        if *part == "." || *part == ".." {
+            return Err(unsafe_name());
+        }
+    }
+    match parts.as_slice() {
+        [table] => Ok(QualifiedName {
+            database: None,
+            schema: None,
+            table,
+        }),
+        [schema, table] => Ok(QualifiedName {
+            database: None,
+            schema: Some(schema),
+            table,
+        }),
+        [database, schema, table] => Ok(QualifiedName {
+            database: Some(database),
+            schema: Some(schema),
+            table,
+        }),
+        _ => Err(unsafe_name()),
     }
 }
 
@@ -132,30 +182,43 @@ fn split_qualified(table: &str) -> (Option<&str>, &str) {
 /// decoded type covers both regardless of what a given SQL Server version declares them
 /// as.
 ///
+/// A three-part name is looked up in its own database's catalog: every database has its
+/// own `INFORMATION_SCHEMA`, so `db.dbo.customers` must be resolved through
+/// `db.INFORMATION_SCHEMA.COLUMNS` rather than the connected database's. The database
+/// name is interpolated because a catalog cannot be selected by a bound parameter; it has
+/// already passed [`validate_identifier`] by then, as every part of the name has.
+///
 /// # Errors
 ///
-/// [`Error::Query`] if the lookup fails, and [`Error::Internal`] if it returns no rows,
-/// which means the table does not exist or the connected account cannot see it.
+/// [`Error::Query`] if the lookup fails or returns a row this crate cannot read,
+/// [`Error::TableNotFound`] if it returns no rows at all, and [`Error::UnsafeTableName`]
+/// if the configured name cannot be parsed into at most three safe parts.
 async fn describe_table(
     client: &mut SqlClient,
     config: &SyncConfig,
     table: &str,
 ) -> Result<Vec<(String, ResolvedType)>> {
-    const PROJECTION: &str = "SELECT COLUMN_NAME, DATA_TYPE, \
+    let parsed = parse_qualified(table)?;
+    let catalog = match parsed.database {
+        Some(database) => format!("{database}.INFORMATION_SCHEMA.COLUMNS"),
+        None => "INFORMATION_SCHEMA.COLUMNS".to_string(),
+    };
+    let projection = format!(
+        "SELECT COLUMN_NAME, DATA_TYPE, \
          CAST(NUMERIC_PRECISION AS int) AS NUMERIC_PRECISION, \
          CAST(NUMERIC_SCALE AS int) AS NUMERIC_SCALE \
-         FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = @P1";
+         FROM {catalog} WHERE TABLE_NAME = @P1"
+    );
 
-    let (schema, name) = split_qualified(table);
-    let rows = match schema {
+    let rows = match parsed.schema {
         Some(schema) => {
-            let sql = format!("{PROJECTION} AND TABLE_SCHEMA = @P2 ORDER BY ORDINAL_POSITION");
-            client.query(sql, &[&name, &schema]).await
+            let sql = format!("{projection} AND TABLE_SCHEMA = @P2 ORDER BY ORDINAL_POSITION");
+            client.query(sql, &[&parsed.table, &schema]).await
         }
         None => {
             let sql =
-                format!("{PROJECTION} AND TABLE_SCHEMA = SCHEMA_NAME() ORDER BY ORDINAL_POSITION");
-            client.query(sql, &[&name]).await
+                format!("{projection} AND TABLE_SCHEMA = SCHEMA_NAME() ORDER BY ORDINAL_POSITION");
+            client.query(sql, &[&parsed.table]).await
         }
     }
     .map_err(|e| connect::query_error(&e, &config.connect.connection_string))?
@@ -164,19 +227,31 @@ async fn describe_table(
     .map_err(|e| connect::query_error(&e, &config.connect.connection_string))?;
 
     if rows.is_empty() {
-        return Err(Error::Internal {
-            detail: "the source table has no columns, or is not visible to this account",
+        return Err(Error::TableNotFound {
+            table: table.to_string(),
         });
     }
 
     let mut columns = Vec::with_capacity(rows.len());
     for row in &rows {
+        // Both are declared NOT NULL by the catalog itself, so a row without them means
+        // the answer is not the catalog this crate expects. Failing here is the whole
+        // point: substituting an empty name would build a column called "" that then
+        // resolves to unrecognised-text and syncs silently wrong, which is exactly the
+        // silent-degradation-of-a-structural-problem this crate's error policy forbids.
+        let missing = || Error::Query {
+            message: format!("the catalog returned a column of {table} with no name or type"),
+        };
         let name: &str = row
             .try_get("COLUMN_NAME")
             .ok()
             .flatten()
-            .unwrap_or_default();
-        let data_type: &str = row.try_get("DATA_TYPE").ok().flatten().unwrap_or_default();
+            .ok_or_else(missing)?;
+        let data_type: &str = row
+            .try_get("DATA_TYPE")
+            .ok()
+            .flatten()
+            .ok_or_else(missing)?;
         let precision: Option<i32> = row.try_get("NUMERIC_PRECISION").ok().flatten();
         let scale: Option<i32> = row.try_get("NUMERIC_SCALE").ok().flatten();
         columns.push((
@@ -188,15 +263,19 @@ async fn describe_table(
 }
 
 /// Awaits `future`, giving up after `timeout_sec` if it is set.
+///
+/// `what` names the operation in the timeout message, so a stalled catalog lookup does
+/// not report itself as a stalled row fetch.
 async fn with_timeout<T>(
     timeout_sec: Option<u64>,
+    what: &str,
     future: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     match timeout_sec {
         Some(secs) => tokio::time::timeout(Duration::from_secs(secs), future)
             .await
             .map_err(|_| Error::Query {
-                message: format!("the source produced no further rows within {secs}s"),
+                message: format!("{what} did not complete within {secs}s"),
             })?,
         None => future.await,
     }
@@ -229,8 +308,10 @@ async fn with_timeout<T>(
 ///
 /// Async; must run on a Tokio runtime.
 pub async fn sync_table(config: &SyncConfig, table_sync: &TableSync) -> Result<TableSyncStats> {
+    let checkpoints = checkpoint::read_all(&config.checkpoint_uri).await?;
+    let last_value = checkpoints.get(&table_sync.table).cloned();
     let mut client = connect::open(&config.connect).await?;
-    sync_one(&mut client, config, table_sync).await
+    sync_one(&mut client, config, table_sync, last_value).await
 }
 
 /// The body of [`sync_table`], against an already-open client.
@@ -238,10 +319,16 @@ pub async fn sync_table(config: &SyncConfig, table_sync: &TableSync) -> Result<T
 /// Split out so [`run`] can sync a whole catalog over one connection instead of logging
 /// in once per table: a run covering many tables otherwise pays a TDS login, and possibly
 /// a TLS handshake, for each one.
+///
+/// `last_value` is this table's checkpoint, read by the caller rather than here. That is
+/// deliberate: the checkpoint table holds every table's row, so reading it once per run
+/// and indexing into it costs one Delta load, whereas reading it here would cost one per
+/// table synced.
 async fn sync_one(
     client: &mut SqlClient,
     config: &SyncConfig,
     table_sync: &TableSync,
+    last_value: Option<String>,
 ) -> Result<TableSyncStats> {
     table_sync.validate()?;
     validate_identifier(&table_sync.table)?;
@@ -250,10 +337,12 @@ async fn sync_one(
         validate_identifier(key)?;
     }
 
-    let checkpoints = checkpoint::read_all(&config.checkpoint_uri).await?;
-    let last_value = checkpoints.get(&table_sync.table).cloned();
-
-    let columns = describe_table(client, config, &table_sync.table).await?;
+    let columns = with_timeout(
+        config.query_timeout_sec,
+        "the catalog lookup",
+        describe_table(client, config, &table_sync.table),
+    )
+    .await?;
 
     let watermark_index = columns
         .iter()
@@ -304,7 +393,7 @@ async fn sync_one(
     let mut batch: Vec<Row> = Vec::with_capacity(config.fetch_batch_size);
 
     loop {
-        let next = with_timeout(config.query_timeout_sec, async {
+        let next = with_timeout(config.query_timeout_sec, "the source", async {
             match rows.next().await {
                 Some(row) => row
                     .map(Some)
@@ -430,6 +519,10 @@ pub fn run(
         })?;
 
     runtime.block_on(async {
+        // Once for the whole run, not once per table: every table's checkpoint lives in
+        // this one Delta table, so re-reading it per table would turn a fixed cost into a
+        // per-table one for no gain.
+        let checkpoints = checkpoint::read_all(&config.checkpoint_uri).await?;
         let mut client = connect::open(&config.connect).await?;
         let total_tables = catalog.tables().len();
         let mut report = SyncReport {
@@ -438,7 +531,8 @@ pub fn run(
         };
 
         for table_sync in catalog.tables() {
-            let stats = sync_one(&mut client, config, table_sync).await?;
+            let last_value = checkpoints.get(&table_sync.table).cloned();
+            let stats = sync_one(&mut client, config, table_sync, last_value).await?;
             report.total_rows_fetched += stats.rows_fetched;
             report.tables.push(stats);
 
@@ -533,13 +627,25 @@ pub fn preflight(config: &SyncConfig, catalog: &SyncCatalog) -> Result<Vec<Table
         })?;
 
     runtime.block_on(async {
-        let checkpoints = checkpoint::read_all(&config.checkpoint_uri).await?;
+        // An empty checkpoint_uri means the caller did not say where checkpoints live and
+        // does not want them reported. Deriving one from an empty output_uri would probe
+        // "/_streamer_checkpoints", an absolute path at the filesystem root, which is
+        // nonsense that only looks harmless because a failed load reads back as empty.
+        let checkpoints = if config.checkpoint_uri.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            checkpoint::read_all(&config.checkpoint_uri).await?
+        };
         let mut client = connect::open(&config.connect).await?;
         let mut out = Vec::with_capacity(catalog.tables().len());
 
         for table_sync in catalog.tables() {
-            validate_identifier(&table_sync.table)?;
-            let columns = describe_table(&mut client, config, &table_sync.table).await?;
+            let columns = with_timeout(
+                config.query_timeout_sec,
+                "the catalog lookup",
+                describe_table(&mut client, config, &table_sync.table),
+            )
+            .await?;
             let has = |wanted: &str| {
                 columns
                     .iter()
@@ -637,9 +743,50 @@ mod tests {
         assert!(relative_path(".").is_err());
     }
 
+    /// The three-part form is the one an earlier version got wrong: splitting on the
+    /// first separator made `db.dbo.customers` mean schema `db`, table `dbo.customers`,
+    /// whose catalog lookup found nothing and reported an internal invariant violation.
     #[test]
-    fn qualified_names_split_into_schema_and_table() {
-        assert_eq!(split_qualified("dbo.customers"), (Some("dbo"), "customers"));
-        assert_eq!(split_qualified("customers"), (None, "customers"));
+    fn qualified_names_split_into_database_schema_and_table() {
+        let one = parse_qualified("customers").unwrap();
+        assert_eq!(
+            (one.database, one.schema, one.table),
+            (None, None, "customers")
+        );
+
+        let two = parse_qualified("dbo.customers").unwrap();
+        assert_eq!(
+            (two.database, two.schema, two.table),
+            (None, Some("dbo"), "customers")
+        );
+
+        let three = parse_qualified("appdb.dbo.customers").unwrap();
+        assert_eq!(
+            (three.database, three.schema, three.table),
+            (Some("appdb"), Some("dbo"), "customers")
+        );
+    }
+
+    #[test]
+    fn a_name_of_more_than_three_parts_is_rejected() {
+        assert!(parse_qualified("server.appdb.dbo.customers").is_err());
+    }
+
+    #[test]
+    fn relative_path_keeps_every_part_of_a_three_part_name() {
+        assert_eq!(
+            relative_path("appdb.dbo.customers").unwrap(),
+            "appdb/dbo/customers"
+        );
+    }
+
+    /// Neither is dangerous, but this crate interpolates identifiers without
+    /// bracket-quoting them, so both would produce SQL that fails somewhere less obvious.
+    #[test]
+    fn identifiers_with_whitespace_or_brackets_are_rejected() {
+        assert!(validate_identifier("my table").is_err());
+        assert!(validate_identifier("[customers]").is_err());
+        assert!(relative_path("dbo.my table").is_err());
+        assert!(parse_qualified("[dbo].[customers]").is_err());
     }
 }

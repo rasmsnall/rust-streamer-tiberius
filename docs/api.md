@@ -196,7 +196,7 @@ A `SyncReport`; see Chapter III.
 | Exception | Raised when |
 |---|---|
 | `ConnectionError` | The source could not be reached, the login was refused, or the login timed out |
-| `ValueError` | Configuration is wrong, or a fetched value contradicts its column's declared type |
+| `ValueError` | Configuration is wrong (a missing key, a missing watermark or key column, a table that does not exist, an unsafe name), or a fetched value contradicts its column's declared type |
 | `RuntimeError` | A Delta write, a checkpoint write, or an internal invariant failed |
 | `OSError` | An underlying I/O failure |
 | `KeyboardInterrupt` | Ctrl-C was pressed between tables |
@@ -377,6 +377,7 @@ and rejects duplicates.
 |---|---|
 | `Connect` | Could not reach the source or log in. Message is redacted |
 | `Query` | A statement failed against an established session. Message is redacted |
+| `TableNotFound` | A configured table does not exist, or the account cannot see it |
 | `IncrementalConfigMissing` | A table has no watermark column or no primary key |
 | `UnrecognisedColumnType` | A source type with no mapping; reported, not fatal |
 | `UnparsableValue` | A value contradicted its column's declared type |
@@ -422,11 +423,17 @@ like any other and which downstream queries filter on.
 
 ### 3. Naming and output paths
 
-A qualified table name maps to a subdirectory: `dbo.customers` is written beneath
-`<output_uri>/dbo/customers`. A name with no schema stays as one path component.
+A table may be named by one, two or three parts, as SQL Server names them:
+`customers`, `dbo.customers` or `appdb.dbo.customers`. Each part becomes a path
+component, so `appdb.dbo.customers` is written beneath
+`<output_uri>/appdb/dbo/customers`. A three-part name is resolved through its own
+database's catalog (`appdb.INFORMATION_SCHEMA.COLUMNS`), since each database has its own.
 
-Names are validated before use. A quote, a semicolon, a backslash or a null byte in a
-table or column name is rejected, as is a path component that is empty, `.` or `..`.
+Names are validated before use. Rejected: a quote, semicolon, backslash or null byte; a
+square bracket or whitespace, because this library does not bracket-quote what it
+interpolates, so `dbo.my table` and `[dbo].[customers]` would produce SQL that fails
+somewhere less obvious; more than three parts; and a component that is empty, `.` or
+`..`.
 
 ### 4. Timestamps and time zones
 

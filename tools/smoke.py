@@ -36,6 +36,32 @@ TABLES = [
 ]
 
 
+HOST = PORT = PASSWORD = None
+
+
+def source_connection():
+    connection = pymssql.connect(
+        server=HOST, port=PORT, user="sa", password=PASSWORD, database="tiberiusdelta_test"
+    )
+    connection.autocommit(True)
+    return connection
+
+
+def query(sql: str) -> list[tuple]:
+    connection = source_connection()
+    cursor = connection.cursor()
+    cursor.execute(sql)
+    rows = cursor.fetchall()
+    connection.close()
+    return rows
+
+
+def execute(sql: str, params: tuple = ()) -> None:
+    connection = source_connection()
+    connection.cursor().execute(sql, params)
+    connection.close()
+
+
 def fail(message: str) -> None:
     raise SystemExit(f"smoke test failed: {message}")
 
@@ -46,9 +72,10 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> int:
-    host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
-    port = sys.argv[2] if len(sys.argv) > 2 else "14330"
-    password = os.environ.get("MSSQL_SA_PASSWORD")
+    global HOST, PORT, PASSWORD
+    host = HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+    port = PORT = sys.argv[2] if len(sys.argv) > 2 else "14330"
+    password = PASSWORD = os.environ.get("MSSQL_SA_PASSWORD")
     if not password:
         raise SystemExit("set MSSQL_SA_PASSWORD to the instance's sa password")
 
@@ -95,14 +122,29 @@ def main() -> int:
         print(f"first sync ok: {report!r}", flush=True)
 
         # 3. The committed Delta table must hold the real values, not just the schema.
+        #    Compared against what the source actually holds right now rather than against
+        #    hardcoded fixture values: this script mutates dbo.customers in step 5, so a
+        #    hardcoded expectation makes the second run of this script fail on state the
+        #    first run left behind. Comparing to the source also tests the stronger and
+        #    more useful property, that Delta matches SQL Server.
+        source = dict(query("SELECT id, name FROM dbo.customers"))
         table = DeltaTable(f"{output}/dbo/customers").to_pyarrow_table()
-        check(table.num_rows == 5, f"expected 5 committed rows, got {table.num_rows}")
+        check(
+            table.num_rows == len(source),
+            f"expected {len(source)} committed rows, got {table.num_rows}",
+        )
         by_id = dict(zip(table.column("id").to_pylist(), table.column("name").to_pylist()))
-        check(by_id.get(1) == "Alice", f"row 1 should be Alice, got {by_id.get(1)!r}")
+        check(by_id == source, f"delta disagrees with the source: {by_id} vs {source}")
         balances = dict(
             zip(table.column("id").to_pylist(), [str(b) for b in table.column("balance").to_pylist()])
         )
-        check(balances.get(3) == "9999.99", f"decimal must be exact, got {balances.get(3)!r}")
+        source_balances = {
+            i: str(b) for i, b in query("SELECT id, balance FROM dbo.customers")
+        }
+        check(
+            balances == source_balances,
+            f"decimals must be exact: {balances} vs {source_balances}",
+        )
         print("delta contents ok", flush=True)
 
         # 4. Second sync: nothing changed, so nothing is re-fetched.
@@ -113,20 +155,16 @@ def main() -> int:
         )
         print("incremental no-op ok", flush=True)
 
-        # 5. Change exactly one row; exactly one row should come back.
-        connection = pymssql.connect(
-            server=host,
-            port=port,
-            user="sa",
-            password=password,
-            database="tiberiusdelta_test",
+        # 5. Change exactly one row; exactly one row should come back. The new watermark
+        #    is derived from the table's current maximum rather than hardcoded, so this
+        #    works however many times the script has run before.
+        marker = f"Alice {os.getpid()}"
+        execute(
+            "DECLARE @next DATETIME2 = "
+            "DATEADD(day, 1, (SELECT MAX(updated_at) FROM dbo.customers)); "
+            "UPDATE dbo.customers SET name = %s, updated_at = @next WHERE id = 1",
+            (marker,),
         )
-        connection.autocommit(True)
-        connection.cursor().execute(
-            "UPDATE dbo.customers SET name = N'Alice II', updated_at = '2026-07-01T00:00:00' "
-            "WHERE id = 1"
-        )
-        connection.close()
 
         report = tiberiusdelta.sync_tables(connection_string, output_uri, TABLES)
         check(
@@ -137,10 +175,15 @@ def main() -> int:
         check(changed.rows_updated == 1, f"the row should update in place, got {changed!r}")
         check(changed.rows_inserted == 0, f"a merge must not duplicate, got {changed!r}")
 
+        source = dict(query("SELECT id, name FROM dbo.customers"))
         table = DeltaTable(f"{output}/dbo/customers").to_pyarrow_table()
-        check(table.num_rows == 5, f"an upsert must not add a row, got {table.num_rows}")
+        check(
+            table.num_rows == len(source),
+            f"an upsert must not add a row: {table.num_rows} vs {len(source)}",
+        )
         by_id = dict(zip(table.column("id").to_pylist(), table.column("name").to_pylist()))
-        check(by_id.get(1) == "Alice II", f"row 1 should have updated, got {by_id.get(1)!r}")
+        check(by_id.get(1) == marker, f"row 1 should have updated, got {by_id.get(1)!r}")
+        check(by_id == source, f"delta should still match the source: {by_id} vs {source}")
         print("incremental update ok", flush=True)
 
         print("smoke test passed", flush=True)
