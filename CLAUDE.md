@@ -16,9 +16,10 @@ of pgdelta's foundational assumptions are flipped here, and the design follows f
 Status: **implemented end to end on `tiberius`.** An earlier ODBC-based version of this
 crate ran end to end first; it has now been replaced by a native `tiberius`
 implementation, since the source engine is confirmed as SQL Server specifically (see "Why
-tiberius, not ODBC"). Every gate passes against a real SQL Server instance: 61 unit
+tiberius, not ODBC"). Every gate passes against a real SQL Server instance: 64 unit
 tests, 4 live end-to-end tests, doctests, `fmt`, `clippy -D warnings`, and
-`RUSTDOCFLAGS=-D warnings cargo doc`.
+`RUSTDOCFLAGS=-D warnings cargo doc`. The wheel builds, and `tools/smoke.py` round-trips
+a live table through it. The three long-form documents are written.
 
 ## Goals / constraints (from the user, verbatim intent)
 
@@ -228,20 +229,25 @@ src/builders.rs   Arrow column + batch builders, fed typed values directly (no t
 src/checkpoint.rs `_streamer_checkpoints` read/write
 src/merge.rs      DeltaTable::merge orchestration per table
 src/pipeline.rs   orchestration: per-table sync loop
-tests/mssql_live.rs  end-to-end tests against a live SQL Server container
-.devtest/*.sql       fixtures that reset that container to a known baseline
-```
-
-Not written yet, mirroring pgdelta's own layout once the Rust side settles:
-
-```
-src/python.rs     pyo3 surface
+src/python.rs        pyo3 surface (sync_tables, preflight)
 python/tiberiusdelta/__init__.py
 python/tiberiusdelta/__init__.pyi
+python/tiberiusdelta/py.typed
+pyproject.toml       maturin config (abi3-py310, mixed layout)
+tests/mssql_live.rs  end-to-end tests against a live SQL Server container
+.devtest/*.sql       fixtures that reset that container to a known baseline
+tools/seed.py        applies those fixtures where sqlcmd is not available (CI)
+tools/smoke.py       round-trips a live table through the built wheel
+tools/md2docx.py     generates docs/*.docx from docs/*.md
 docs/architecture.md
 docs/api.md
 docs/operations.md
 ```
+
+Build the wheel with maturin (`pip install maturin && maturin build --release
+--features extension-module,azure`). CI additionally runs the live suite and the smoke
+test against a SQL Server service container, so the type mapping is a real CI gate rather
+than a local-only check.
 
 `src/values.rs` (ODBC-era text parsing) is gone: `tiberius::Row::cells()` yields values
 already decoded into `ColumnData` variants, so there is no text to parse. What replaced
