@@ -31,16 +31,44 @@ use deltalake::datafusion::logical_expr::{Expr, col};
 use deltalake::datafusion::prelude::SessionContext;
 use deltalake::kernel::StructType;
 use deltalake::kernel::engine::arrow_conversion::TryIntoKernel;
+use deltalake::kernel::transaction::TransactionError;
 use deltalake::operations::merge::MergeMetrics;
 use deltalake::protocol::SaveMode;
 use deltalake::table::builder::ensure_table_uri;
-use deltalake::{DeltaTable, DeltaTableBuilder, arrow::array::RecordBatch};
+use deltalake::{DeltaTable, DeltaTableBuilder, DeltaTableError, arrow::array::RecordBatch};
 
 use crate::error::{Error, Result};
 
 fn delta_err(e: impl std::fmt::Display) -> Error {
     Error::Delta {
         message: e.to_string(),
+    }
+}
+
+/// Classifies a Delta failure, separating a lost commit race from everything else.
+///
+/// Matched on the error's structure rather than its message text, so a reworded
+/// diagnostic upstream cannot silently turn a recognised conflict back into an opaque
+/// one. Every conflict variant counts, not only `ConcurrentAppend`: from this crate's
+/// point of view they all mean the same thing, which is that another writer got there
+/// first and this run should simply be repeated.
+///
+/// `MaxCommitAttempts` is included for the same reason: delta-rs raises it after retrying
+/// a conflict as many times as it is willing to, so it is a conflict that did not resolve
+/// rather than a distinct kind of failure.
+fn commit_err(e: DeltaTableError, table_uri: &str) -> Error {
+    let conflict = matches!(
+        &e,
+        DeltaTableError::Transaction {
+            source: TransactionError::CommitConflict(_) | TransactionError::MaxCommitAttempts(_),
+        }
+    );
+    if conflict {
+        Error::ConcurrentWrite {
+            table: table_uri.to_string(),
+        }
+    } else {
+        delta_err(e)
     }
 }
 
@@ -89,8 +117,9 @@ pub async fn open_or_create(uri: &str, schema: &ArrowSchemaRef) -> Result<DeltaT
 /// # Errors
 ///
 /// [`Error::Internal`] if `primary_key` is empty (this would match every row against
-/// every row, which is never the intended merge), and [`Error::Delta`] for a commit
-/// conflict or storage failure.
+/// every row, which is never the intended merge), [`Error::ConcurrentWrite`] if another
+/// writer committed to the same table first, and [`Error::Delta`] for any other storage
+/// or protocol failure.
 ///
 /// # Panics
 ///
@@ -119,6 +148,7 @@ pub async fn upsert(
         .map(|f| f.name().clone())
         .collect();
 
+    let table_uri = table.table_url().to_string();
     let ctx = SessionContext::new();
     let source = ctx.read_batch(batch).map_err(delta_err)?;
     let session_state = Arc::new(ctx.state());
@@ -144,7 +174,7 @@ pub async fn upsert(
         })
         .map_err(delta_err)?
         .await
-        .map_err(delta_err)
+        .map_err(|e| commit_err(e, &table_uri))
 }
 
 #[cfg(test)]

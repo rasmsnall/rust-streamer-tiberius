@@ -39,6 +39,35 @@ pub enum Error {
         message: String,
     },
 
+    /// Another writer committed to this table's Delta table at the same time.
+    ///
+    /// Delta's optimistic concurrency detected the conflict and refused the commit, so
+    /// nothing is corrupted: the data is exactly as the other writer left it. The usual
+    /// cause is two runs of the same sync overlapping, which on Databricks means a job
+    /// whose "maximum concurrent runs" is above one, or a manual run started while the
+    /// scheduled one was still going.
+    ///
+    /// Safe to retry: the merge is an upsert and the checkpoint of a table that failed
+    /// here was never advanced, so a later run re-fetches and re-applies the same rows.
+    ConcurrentWrite {
+        /// Qualified table name whose commit lost the race.
+        table: String,
+    },
+
+    /// A column named in a table's configuration does not exist in that table.
+    ///
+    /// Distinct from [`Error::IncrementalConfigMissing`], which is about configuration
+    /// that was never supplied; this is configuration that was supplied and does not
+    /// match the source, which is what happens when a column is renamed or dropped.
+    ColumnNotFound {
+        /// Qualified table name.
+        table: String,
+        /// The configured column that the table does not have.
+        column: String,
+        /// What the column was configured as, for example "watermark column".
+        role: &'static str,
+    },
+
     /// A configured table does not exist, or the connected account cannot see it.
     ///
     /// Its own variant rather than [`Error::Internal`], which would tell the caller this
@@ -172,6 +201,18 @@ impl fmt::Display for Error {
         match self {
             Error::Connect { message } => write!(f, "connection error: {message}"),
             Error::Query { message } => write!(f, "query error: {message}"),
+            Error::ConcurrentWrite { table } => write!(
+                f,
+                "another writer committed to {table} at the same time, so this commit was                  refused; nothing was corrupted and the sync can simply be re-run. If this                  recurs, ensure only one sync runs at a time (on Databricks, set the job's                  maximum concurrent runs to 1)"
+            ),
+            Error::ColumnNotFound {
+                table,
+                column,
+                role,
+            } => write!(
+                f,
+                "{table} has no column {column}, configured as its {role}; run a pre-flight                  check to see the columns it does have"
+            ),
             Error::TableNotFound { table } => write!(
                 f,
                 "table {table} does not exist, or this account has no SELECT grant on it"
@@ -206,6 +247,50 @@ impl fmt::Display for Error {
             Error::Io { message } => write!(f, "io error: {message}"),
             Error::Interrupted => f.write_str("sync interrupted by caller"),
             Error::Internal { detail } => write!(f, "internal invariant violated: {detail}"),
+        }
+    }
+}
+
+impl Error {
+    /// Returns this error with `table` named in its message, if it does not already say.
+    ///
+    /// A run covers many tables, so "delta error: ..." is markedly less useful than
+    /// "delta error on dbo.invoices: ...". Only the variants whose message is free text
+    /// are annotated; the rest already carry the table in a field of their own and would
+    /// only be made repetitive by this.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic.
+    #[must_use]
+    pub fn in_table(self, table: &str) -> Self {
+        let annotate = |message: String| {
+            if message.contains(table) {
+                message
+            } else {
+                format!("on table {table}: {message}")
+            }
+        };
+        match self {
+            Error::Connect { message } => Error::Connect {
+                message: annotate(message),
+            },
+            Error::Query { message } => Error::Query {
+                message: annotate(message),
+            },
+            Error::Delta { message } => Error::Delta {
+                message: annotate(message),
+            },
+            Error::Arrow { message } => Error::Arrow {
+                message: annotate(message),
+            },
+            Error::Checkpoint { message } => Error::Checkpoint {
+                message: annotate(message),
+            },
+            Error::Io { message } => Error::Io {
+                message: annotate(message),
+            },
+            other => other,
         }
     }
 }

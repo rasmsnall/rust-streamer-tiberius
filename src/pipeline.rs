@@ -48,6 +48,42 @@ pub struct SyncConfig {
     pub query_timeout_sec: Option<u64>,
 }
 
+impl SyncConfig {
+    /// Rejects settings that cannot produce a working run.
+    ///
+    /// Checked before a connection is opened, so a misconfiguration costs nothing and
+    /// fails where the cause is obvious. Each of these would otherwise fail later and
+    /// less clearly: an empty `output_uri` writes tables to a relative path nobody meant,
+    /// and a `fetch_batch_size` of zero merges once per row, turning a bounded-memory
+    /// design into one Delta commit per row.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Internal`] naming the setting at fault.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic.
+    pub fn validate(&self) -> Result<()> {
+        if self.output_uri.trim().is_empty() {
+            return Err(Error::Internal {
+                detail: "output_uri is empty; there is nowhere to write tables",
+            });
+        }
+        if self.checkpoint_uri.trim().is_empty() {
+            return Err(Error::Internal {
+                detail: "checkpoint_uri is empty; there is nowhere to record progress",
+            });
+        }
+        if self.fetch_batch_size == 0 {
+            return Err(Error::Internal {
+                detail: "fetch_batch_size is zero; it must be at least one row",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// What one table's sync produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSyncStats {
@@ -347,9 +383,28 @@ async fn sync_one(
     let watermark_index = columns
         .iter()
         .position(|(name, _)| name.eq_ignore_ascii_case(&table_sync.watermark_column))
-        .ok_or(Error::Internal {
-            detail: "the watermark column is not a column of this table",
+        .ok_or_else(|| Error::ColumnNotFound {
+            table: table_sync.table.clone(),
+            column: table_sync.watermark_column.clone(),
+            role: "watermark column",
         })?;
+
+    // Checked here rather than discovered inside the merge: a primary key column the
+    // table does not have fails deep in DataFusion's planner with a message about an
+    // unresolved expression, which says nothing about which table or which configured
+    // column is at fault.
+    for key in &table_sync.primary_key {
+        if !columns
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(key))
+        {
+            return Err(Error::ColumnNotFound {
+                table: table_sync.table.clone(),
+                column: key.clone(),
+                role: "primary key column",
+            });
+        }
+    }
     let text_fallback_columns: Vec<String> = columns
         .iter()
         .filter(|(_, rt)| !rt.recognised)
@@ -511,6 +566,15 @@ pub fn run(
     catalog: &SyncCatalog,
     mut on_progress: impl FnMut(Progress) -> bool,
 ) -> Result<SyncReport> {
+    config.validate()?;
+    // Nothing to do, and nothing worth opening a connection for.
+    if catalog.tables().is_empty() {
+        return Ok(SyncReport {
+            tables: Vec::new(),
+            total_rows_fetched: 0,
+        });
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -532,7 +596,10 @@ pub fn run(
 
         for table_sync in catalog.tables() {
             let last_value = checkpoints.get(&table_sync.table).cloned();
-            let stats = sync_one(&mut client, config, table_sync, last_value).await?;
+            // A run covers many tables, so every failure says which one it was.
+            let stats = sync_one(&mut client, config, table_sync, last_value)
+                .await
+                .map_err(|e| e.in_table(&table_sync.table))?;
             report.total_rows_fetched += stats.rows_fetched;
             report.tables.push(stats);
 
@@ -626,6 +693,10 @@ pub fn preflight(config: &SyncConfig, catalog: &SyncCatalog) -> Result<Vec<Table
             message: e.to_string(),
         })?;
 
+    if catalog.tables().is_empty() {
+        return Ok(Vec::new());
+    }
+
     runtime.block_on(async {
         // An empty checkpoint_uri means the caller did not say where checkpoints live and
         // does not want them reported. Deriving one from an empty output_uri would probe
@@ -645,7 +716,8 @@ pub fn preflight(config: &SyncConfig, catalog: &SyncCatalog) -> Result<Vec<Table
                 "the catalog lookup",
                 describe_table(&mut client, config, &table_sync.table),
             )
-            .await?;
+            .await
+            .map_err(|e| e.in_table(&table_sync.table))?;
             let has = |wanted: &str| {
                 columns
                     .iter()
@@ -717,6 +789,90 @@ mod tests {
             last_synced_value: None,
         };
         assert!(p.is_ready());
+    }
+
+    fn config(output_uri: &str, checkpoint_uri: &str, batch: usize) -> SyncConfig {
+        SyncConfig {
+            connect: ConnectConfig {
+                connection_string: "Server=x".to_string(),
+                login_timeout_sec: None,
+            },
+            output_uri: output_uri.to_string(),
+            checkpoint_uri: checkpoint_uri.to_string(),
+            fetch_batch_size: batch,
+            query_timeout_sec: None,
+        }
+    }
+
+    /// Each of these would otherwise fail later and less clearly, after a connection had
+    /// already been opened against a production database.
+    #[test]
+    fn unworkable_settings_are_rejected_before_anything_connects() {
+        assert!(
+            config("file:///out", "file:///out/_c", 10)
+                .validate()
+                .is_ok()
+        );
+        assert!(config("", "file:///out/_c", 10).validate().is_err());
+        assert!(config("   ", "file:///out/_c", 10).validate().is_err());
+        assert!(config("file:///out", "", 10).validate().is_err());
+        assert!(
+            config("file:///out", "file:///out/_c", 0)
+                .validate()
+                .is_err()
+        );
+    }
+
+    /// A run over no tables should not open a connection to do nothing with.
+    #[test]
+    fn an_empty_catalog_produces_an_empty_report_without_connecting() {
+        let catalog = SyncCatalog::new(Vec::new()).unwrap();
+        let report = run(
+            &config("file:///out", "file:///out/_c", 10),
+            &catalog,
+            |_| true,
+        )
+        .unwrap();
+        assert!(report.tables.is_empty());
+        assert_eq!(report.total_rows_fetched, 0);
+
+        let found = preflight(&config("file:///out", "file:///out/_c", 10), &catalog).unwrap();
+        assert!(found.is_empty());
+    }
+
+    /// A run covers many tables, so a bare "delta error: ..." does not say which failed.
+    #[test]
+    fn errors_gain_the_table_they_happened_on() {
+        let annotated = Error::Delta {
+            message: "object store timed out".to_string(),
+        }
+        .in_table("dbo.invoices");
+        assert_eq!(
+            annotated.to_string(),
+            "delta error: on table dbo.invoices: object store timed out"
+        );
+    }
+
+    /// Annotating twice, or annotating a message that already names the table, must not
+    /// stutter: errors cross several layers and each is entitled to add context.
+    #[test]
+    fn annotating_an_error_that_already_names_the_table_changes_nothing() {
+        let once = Error::Query {
+            message: "syntax error".to_string(),
+        }
+        .in_table("dbo.invoices");
+        let twice = once.clone().in_table("dbo.invoices");
+        assert_eq!(once, twice);
+    }
+
+    /// A variant that already carries the table in a field of its own gains nothing from
+    /// having it repeated in the message.
+    #[test]
+    fn annotating_leaves_variants_that_already_carry_a_table_alone() {
+        let err = Error::TableNotFound {
+            table: "dbo.invoices".to_string(),
+        };
+        assert_eq!(err.clone().in_table("dbo.invoices"), err);
     }
 
     #[test]

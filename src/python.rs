@@ -7,6 +7,7 @@
 //! Executes on the thread that called into it. The sync work runs with the GIL released;
 //! the progress callback re-acquires it.
 
+use pyo3::create_exception;
 use pyo3::exceptions::{
     PyConnectionError, PyIOError, PyKeyboardInterrupt, PyRuntimeError, PyValueError,
 };
@@ -18,6 +19,13 @@ use crate::connect::ConnectConfig;
 use crate::error::Error;
 use crate::pipeline::{self, Progress, SyncConfig, TablePreflight, TableSyncStats};
 
+create_exception!(
+    _tiberiusdelta,
+    ConcurrentWriteError,
+    PyRuntimeError,
+    "Another writer committed to the same Delta table at the same time, so this commit      was refused. Nothing is corrupted and no checkpoint advanced for the affected table,      so re-running is safe and re-applies the same rows idempotently. Usually means two      syncs overlapped: on Databricks, set the job's maximum concurrent runs to 1. Carries      a `table` attribute. Subclasses RuntimeError, so an existing handler still catches it."
+);
+
 /// Registers everything the extension module exposes.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sync_tables, module)?)?;
@@ -27,6 +35,10 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyTablePreflight>()?;
     module.add_class::<PyColumnPreflight>()?;
     module.add(
+        "ConcurrentWriteError",
+        module.py().get_type::<ConcurrentWriteError>(),
+    )?;
+    module.add(
         "__all__",
         (
             "sync_tables",
@@ -35,6 +47,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "TableSyncStats",
             "TablePreflight",
             "ColumnPreflight",
+            "ConcurrentWriteError",
         ),
     )?;
     Ok(())
@@ -53,6 +66,14 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 fn to_pyerr(err: Error) -> PyErr {
     let message = err.to_string();
     match err {
+        // Its own type because it is the one failure worth retrying automatically and
+        // worth distinguishing from a real Delta fault, and the table is attached as an
+        // attribute so a caller need not parse it out of the message.
+        Error::ConcurrentWrite { ref table } => Python::attach(|py| {
+            let raised = ConcurrentWriteError::new_err(message.clone());
+            let _ = raised.value(py).setattr("table", table.clone());
+            raised
+        }),
         Error::Interrupted => PyKeyboardInterrupt::new_err(message),
         Error::Io { .. } => PyIOError::new_err(message),
         Error::Connect { .. } => PyConnectionError::new_err(message),
