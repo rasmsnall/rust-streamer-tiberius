@@ -1,0 +1,18 @@
+/target
+
+# The .devtest/*.sql fixtures are committed deliberately: tests/mssql_live.rs and CI both
+# depend on them to build a known baseline, so they are project content, not scratch.
+# Anything else dropped in there is not.
+/.devtest/*
+!/.devtest/*.sql
+
+# Python build and test artefacts from the mixed maturin layout.
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+/dist/
+*.egg-info/
+.venv/
+.mypy_cache/
+.pytest_cache/

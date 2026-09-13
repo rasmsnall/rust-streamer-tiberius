@@ -1,0 +1,75 @@
+[package]
+name = "tiberiusdelta"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Stream a live SQL Server database incrementally into Delta Lake tables"
+license = "MIT"
+publish = false
+
+[lib]
+name = "tiberiusdelta"
+path = "src/lib.rs"
+# cdylib for the Python extension module; rlib so the crate's own tests can link it.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Python bindings. abi3-py310 builds one wheel that loads on CPython 3.10 and later.
+pyo3 = { version = "0.29.2", features = ["abi3-py310"] }
+
+# Native, pure-Rust async TDS (SQL Server wire protocol) client. No ODBC driver manager
+# and no driver install: the connection is a plain TCP socket this crate opens itself.
+# `rustls` (not `native-tls`) keeps the TLS stack pure-Rust; `chrono` gives typed
+# date/time decoding; `tds73` is what makes the TDS 7.3 temporal types (DATE, TIME,
+# DATETIME2, DATETIMEOFFSET) decode at all, and is in tiberius's default feature set,
+# which this disables wholesale. `winauth` is deliberately left off: this authenticates
+# with a SQL Server login, not Windows integrated auth. Runtime-agnostic by design, so
+# `tokio`/`tokio-util` below provide the socket and the IO compatibility shim.
+tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls", "tokio", "chrono"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+# Named directly by builders.rs, converting tiberius's decoded temporal values into the
+# epoch-relative integers Arrow stores. Single semver line (0.4) shared with what both
+# tiberius and deltalake resolve, so there is no version to skew.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+# Delta write path; brings arrow/parquet/object_store/tokio/chrono. `datafusion` is
+# needed for DeltaTable::merge (transactional upsert by key), which is how incremental
+# sync applies new and changed rows without hand-rolling Delta's file-rewrite logic.
+# This is a materially heavier dependency than pgdelta carries (a full query engine), a
+# deliberate, documented exception to the minimal-dependency default: see
+# docs/architecture.md and CLAUDE.md's Dependency budget.
+deltalake = { version = "0.32.4", features = ["datafusion"] }
+
+# Pinned exactly: 1.2.0 removed the `parse_column_name!` macro that deltalake's kernel
+# dependency (`buoyant_kernel` 0.22.2) requires, without a semver-major bump, breaking
+# the build with `datafusion` enabled ("could not find `parse_column_name` in
+# `delta_kernel_derive`"). 1.1.0 still has it. Revisit when deltalake bumps its own
+# `buoyant_kernel` constraint past this.
+buoyant_kernel_derive = "=1.1.0"
+
+# Named directly by connect.rs and pipeline.rs. Pinned to what deltalake resolves.
+# `net` opens the raw TCP socket tiberius connects its TDS session over.
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "sync", "net"] }
+futures = "0.3.34"
+
+[dev-dependencies]
+bytes = "1.12.1"
+# `macros` only, for #[tokio::test]; the library itself never needs them.
+tokio = { version = "1.53.1", features = ["macros"] }
+
+[features]
+default = []
+# Links the extension module against the Python interpreter that loads it, rather than
+# libpython. Enabled by the wheel build; must stay off for `cargo test`.
+extension-module = ["pyo3/extension-module"]
+# Cloud object stores, for the Delta *output* side. Not needed for a local path or a
+# /Volumes FUSE path.
+azure = ["deltalake/azure"]
+gcp = ["deltalake/gcs"]
+s3 = ["deltalake/s3"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
