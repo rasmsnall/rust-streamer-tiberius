@@ -27,9 +27,11 @@
   - 3. Load on the source
 - IV. Sizing
   - 1. What scales and what does not
-  - 2. Memory
-  - 3. The first run
-  - 4. Expected runtime
+  - 2. Measured throughput
+  - 3. Memory
+  - 4. The first run
+  - 5. Scaling out across workers
+  - 6. Bulk backfill and handover
 - V. Storage Maintenance
   - 1. Why storage grows
   - 2. Scheduling VACUUM
@@ -56,6 +58,7 @@
 
 - `<Table 3-1>` Watermark column suitability
 - `<Table 4-1>` What scales with what
+- `<Table 4-2>` Measured throughput
 - `<Table 6-1>` Diagnosing by exception
 - `<Table 7-1>` What to record every run
 - `<Table 7-2>` Alert conditions
@@ -249,7 +252,34 @@ Two things make it not small:
 
 `<Table 4-1>` What scales with what
 
-### 2. Memory
+### 2. Measured throughput
+
+Measured through the built wheel against SQL Server 2022, one million rows, on a local
+container with Delta written to local disk.
+
+| Case | Result |
+|---|---|
+| Full load, `fetch_batch_size=100_000` | 489,000 rows/s |
+| Full load, `fetch_batch_size=20_000` | 286,000 rows/s |
+| Unchanged table, nothing to fetch | ~26 ms |
+| 450 unchanged tables, one worker | ~13 s |
+
+`<Table 4-2>` Measured throughput
+
+Two things about these numbers matter more than their size.
+
+**They are an upper bound.** The container is local, so there is no network round trip to
+SQL Server, and Delta was written to local disk rather than object storage. In production
+the dominant per-table cost is the Delta commit, which on ADLS or S3 is several HTTPS
+round trips, so budget a few hundred milliseconds per *changed* table rather than 26 ms.
+Several hundred tables still lands in minutes.
+
+**Row throughput is rarely the constraint.** An incremental run moves the change, not the
+table, so the fixed per-table cost dominates a steady-state run and the row rate barely
+matters. The row rate only matters for a first load or a backfill, which is what
+Section 6 is about.
+
+### 3. Memory
 
 ```
 peak memory ~ fetch_batch_size x row width + the Arrow batch + Parquet writer buffers
@@ -261,7 +291,7 @@ At the default of ten thousand rows, a wide row of a few kilobytes is tens of me
 Lower it for very wide rows; raising it does not make the source faster and raises the
 footprint proportionally.
 
-### 3. The first run
+### 4. The first run
 
 A table with no checkpoint has no `WHERE` clause and fetches every row. Plan for it:
 
@@ -270,16 +300,81 @@ A table with no checkpoint has no `WHERE` clause and fetches every row. Plan for
 - Expect the first run's duration to resemble a full export of that table.
 - Every run after it is proportional to change.
 
-### 4. Expected runtime
+### 5. Scaling out across workers
 
-Dominated by whichever of these is largest: the source's scan, the network transfer, or
-the Delta merge. For a steady-state incremental run of a few thousand rows across a few
-dozen tables, the merges usually dominate, because each one is a Delta commit with its own
-object-store round trips regardless of how few rows it carries.
+A single worker is enough for most workloads; Section 2 is the evidence. When it is not,
+throughput scales with workers and needs no change to the sync:
 
-A run covering many tables that change rarely therefore costs roughly a fixed amount per
-table. If that becomes the bottleneck, syncing tables concurrently is the available
-improvement and is not currently implemented; see `architecture.md`, Chapter IV, Section 4.
+```python
+from tiberiusdelta.distributed import sync_tables_distributed
+
+report = sync_tables_distributed(connection_string, OUTPUT, TABLES)
+print(report["total_rows_fetched"], "rows;", len(report["failures"]), "partitions failed")
+```
+
+This works because every table is independent all the way down: its own Delta table, its
+own checkpoint Delta table, no cross-table transaction, and no shared writer. Two workers
+therefore never write the same Delta table, so there is nothing to coordinate and no lock
+to take. Adding executors adds throughput.
+
+Practical notes:
+
+- **Partitioning is automatic.** More partitions than executor cores, so Spark can hand a
+  free executor the next one rather than idling behind a slow partition, and fewer
+  partitions than tables, so a partition's tables share one connection. Override with
+  `num_partitions` if you have a reason.
+- **Spark's task retries are safe.** A sync is idempotent, so a retried table re-applies
+  the same rows rather than duplicating them. Nothing special is needed to allow this.
+- **A failed partition does not fail the job.** Its tables are reported in `failures` and
+  everything else keeps its progress; the failed tables are picked up by the next run,
+  since their checkpoints never advanced. Pass `raise_on_error=False` to inspect rather
+  than raise.
+- **The connection string reaches every executor.** Inherent to distributing the work, and
+  a reason the cluster should be one you trust with the credential.
+- **`progress` is not supported.** A callback cannot run on the driver while the work runs
+  on executors. Read the returned report instead.
+
+### 6. Bulk backfill and handover
+
+The one case where row throughput genuinely constrains you is seeding a very large table
+for the first time. Do not reach for more workers here: reach for a bulk export.
+
+A file export read in bulk beats any live query, however parallel, because it stops paying
+per-row protocol costs entirely. For scale, the sibling project `pgdelta` moves 224 million
+rows from a PostgreSQL dump in about two minutes, roughly four times the rate measured in
+Section 2 for a live query, and it does that on one node.
+
+The procedure, and the order matters:
+
+1. **Capture the watermark first**, before exporting anything.
+
+   ```python
+   watermark = tiberiusdelta.source_watermark(connection_string, TABLE)
+   ```
+
+2. **Export and load the table by whatever bulk means is fastest**: `bcp` out of SQL
+   Server, then read the files with Spark and write the Delta table directly. This library
+   is not involved.
+
+3. **Record the checkpoint**, using the value captured in step 1.
+
+   ```python
+   tiberiusdelta.set_checkpoint(OUTPUT, TABLE, watermark)
+   ```
+
+4. **Run the incremental sync as usual.** It fetches only what changed since, rather than
+   re-pulling the whole table.
+
+Capturing the watermark *before* the export is what makes this correct. A watermark read
+afterwards sits ahead of rows written while the export was running, and the
+strictly-greater-than filter would then skip those rows permanently. Captured first, such
+rows are merely re-fetched by the first incremental run, which is harmless because the
+merge is idempotent. The error is safe in one direction only, so when unsure choose the
+earlier value.
+
+The risk to respect: `set_checkpoint` records progress for data it has not verified. A
+value ahead of what was actually loaded silently skips the rows in between, and nothing
+reports it. Verify the row count against the source before relying on the table.
 
 ## V. Storage Maintenance
 

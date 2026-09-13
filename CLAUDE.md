@@ -83,8 +83,9 @@ tiberius connection (TCP + TDS, no driver manager)
      unlike the earlier ODBC-based version of this crate
   -> DeltaTable::merge, keyed on the table's primary key (upsert: new rows insert,
      matching rows update)
-  -> checkpoint recorded in `_streamer_checkpoints` (table, watermark_column,
-     last_value, synced_at), the same role pgdelta's `_pgdelta_loads` plays
+  -> checkpoint recorded in that table's *own* Delta table under
+     `_streamer_checkpoints/<schema>/<table>` (table_name, watermark_column, last_value,
+     synced_at), the same role pgdelta's `_pgdelta_loads` plays
 ```
 
 Read at the start of a run, advanced only after that table's merge has committed; see
@@ -319,6 +320,33 @@ epoch, each checked rather than cast.
   matching fallbacks, which is the tell). `crate::builders` therefore accepts a NULL from
   any variant, which is lossless, while still rejecting a *non-null* value of the wrong
   width, which would not be.
+
+## Scaling
+
+Measured through the built wheel against SQL Server 2022, one million rows, local
+container, Delta on local disk: **489k rows/s** at `fetch_batch_size=100_000`, **~26 ms**
+for an unchanged table, **~13 s** for 450 unchanged tables on one worker. An upper bound
+(no network RTT, no object-store commits), but it settles the question: row throughput is
+almost never the constraint, and the fixed per-table cost dominates a steady-state run.
+
+For comparison, pgdelta moves 224M rows from a dump in ~2 minutes, about 4x this rate.
+Same order of magnitude, which was not the expectation going in.
+
+**Scaling out needs no new code, only workers.** `tiberiusdelta.distributed` spreads the
+table list across Spark executors. That is possible because the design is shared-nothing:
+no cross-table transaction, one Delta table per source table, one *checkpoint* Delta table
+per source table, and idempotent merges (so Spark's task retries are safe). The per-table
+checkpoint layout exists specifically for this; a shared checkpoint table would be one
+Delta table every worker must commit to, and Delta resolves that contention by failing
+writers.
+
+**Not built, deliberately: splitting one large table across workers.** They would all merge
+into the same Delta table, so contention returns, and the sound version stages Parquet per
+range and makes one commit, which is a different design. For the case it would serve,
+seeding a very large table, a bulk file export is simply better: `pipeline::source_watermark`
+and `pipeline::set_checkpoint` hand over to incremental sync after a bulk load, so the
+library supports that route rather than trying to beat it. Correctness there rests entirely
+on capturing the watermark *before* the export.
 
 ## Open items
 

@@ -23,6 +23,8 @@
   - 6. Exceptions
   - 7. The progress callback
   - 8. `preflight`
+  - 9. `source_watermark` and `set_checkpoint`
+  - 10. Distributing across workers
 - III. Returned Statistics
   - 1. `SyncReport`
   - 2. `TableSyncStats`
@@ -196,6 +198,7 @@ A `SyncReport`; see Chapter III.
 | Exception | Raised when |
 |---|---|
 | `ConnectionError` | The source could not be reached, the login was refused, or the login timed out |
+| `ConcurrentWriteError` | Another writer committed to the same Delta table first. Subclasses `RuntimeError`; carries a `table` attribute. Safe to retry: nothing was corrupted and no checkpoint advanced |
 | `ValueError` | Configuration is wrong (a missing key, a missing watermark or key column, a table that does not exist, an unsafe name), or a fetched value contradicts its column's declared type |
 | `RuntimeError` | A Delta write, a checkpoint write, or an internal invariant failed |
 | `OSError` | An underlying I/O failure |
@@ -256,6 +259,48 @@ reading checkpoints.
 This is the cheap thing to run when onboarding an unfamiliar schema, and cheap enough to
 run before every scheduled sync as a guard against a schema change; see `operations.md`,
 Chapter II, Section 4.
+
+### 9. `source_watermark` and `set_checkpoint`
+
+The two halves of a bulk backfill, for a table too large to seed a row at a time. Neither
+syncs anything.
+
+```python
+watermark = tiberiusdelta.source_watermark(connection_string, TABLE)   # before exporting
+# ... export and load the table by whatever bulk means is fastest ...
+tiberiusdelta.set_checkpoint(OUTPUT, TABLE, watermark)                 # hand over
+```
+
+`source_watermark` returns the table's current greatest watermark value, rendered exactly
+as a checkpoint records it, or `None` for an empty table. `set_checkpoint` records it, so
+the next sync fetches only what changed since rather than re-pulling everything.
+
+**Capture the watermark before the export, never after.** Read afterwards, it sits ahead
+of rows written while the export was running, and the strictly-greater-than filter skips
+those rows permanently. Read first, they are merely re-fetched by the first incremental
+run, which the idempotent merge makes harmless. The mistake is safe in one direction and
+silent in the other, so when unsure choose the earlier value.
+
+`set_checkpoint` records progress for data it has not verified. A value ahead of what was
+actually loaded silently skips the rows in between. Verify the row count against the
+source before relying on the table.
+
+### 10. Distributing across workers
+
+```python
+from tiberiusdelta.distributed import sync_tables_distributed
+
+report = sync_tables_distributed(connection_string, OUTPUT, TABLES)
+```
+
+Each table is synced exactly as `sync_tables` would sync it; only the machine differs.
+Returns a dict with `tables`, `failures` and `total_rows_fetched`. `pyspark` is imported
+lazily, so the package does not require it.
+
+A failed partition is reported rather than failing the job, since every table keeps its
+own progress independently. `progress` is not supported, because a callback cannot run on
+the driver while the work runs on executors. See `operations.md`, Chapter IV, Section 5
+for when this is worth reaching for, which is later than most people expect.
 
 ## III. Returned Statistics
 
@@ -377,6 +422,8 @@ and rejects duplicates.
 |---|---|
 | `Connect` | Could not reach the source or log in. Message is redacted |
 | `Query` | A statement failed against an established session. Message is redacted |
+| `ConcurrentWrite` | Another writer committed to the same Delta table first |
+| `ColumnNotFound` | A configured watermark or primary key column does not exist |
 | `TableNotFound` | A configured table does not exist, or the account cannot see it |
 | `IncrementalConfigMissing` | A table has no watermark column or no primary key |
 | `UnrecognisedColumnType` | A source type with no mapping; reported, not fatal |

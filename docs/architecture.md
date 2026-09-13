@@ -21,6 +21,7 @@
   - 2. The checkpoint
   - 3. Ordering of merge and checkpoint
   - 4. What incremental sync cannot do
+  - 5. Bulk backfill and handover
 - III. Pipeline Architecture
   - 1. Stage overview
   - 2. Connect
@@ -33,7 +34,8 @@
   - 1. Execution model by component
   - 2. Rationale for the division
   - 3. The Global Interpreter Lock
-  - 4. Known ceiling
+  - 4. Scaling out
+  - 5. The remaining ceiling
 - V. Resource Model
 - VI. Failure Model
   - 1. The consistency boundary
@@ -178,9 +180,16 @@ this design has: a column that can decrease will silently skip rows forever.
 
 ### 2. The checkpoint
 
-Each table's last synced watermark value is recorded in a Delta table,
-`_streamer_checkpoints`, beneath the output prefix. It holds one row per source table,
-upserted rather than appended, with the qualified table name as its key.
+Each table's last synced watermark value is recorded in **its own** Delta table, at
+`<checkpoint_uri>/<schema>/<table>`, mirroring the layout of the data tables themselves.
+
+One table per source table, rather than one shared table with a row each, is the choice
+that makes Chapter IV, Section 4 possible. A shared checkpoint table is a single Delta
+table every sync must commit to, so workers running at once contend on it and Delta
+resolves that by failing one of them. Per-table checkpoints remove the shared mutable
+resource, so nothing needs coordinating. The cost is that one query no longer shows every
+checkpoint; each still carries its own `table_name`, so a union view over the prefix
+restores that.
 
 | Column | Meaning |
 |---|---|
@@ -237,6 +246,22 @@ Stated plainly here rather than discovered during an incident.
 - **A row updated without touching its watermark is invisible.** Follows from the same
   mechanism, and is the reason a `DATETIME2` maintained by a trigger or by an application
   convention is only as reliable as that trigger or convention.
+
+### 5. Bulk backfill and handover
+
+Seeding a very large table one row at a time is the one case this design is poor at, and
+the answer is not to make it parallel but to not do it. The table is loaded by a bulk
+export, and this library is then told where that load got to:
+
+```
+capture watermark -> bulk export and load by other means -> record checkpoint -> incremental from there
+```
+
+`pipeline::source_watermark` and `pipeline::set_checkpoint` are the two ends of that, and
+neither syncs anything. Correctness rests entirely on capturing the watermark *before* the
+export: read afterwards, it sits ahead of rows written during the export and those rows are
+skipped permanently; read first, they are merely re-fetched, which the idempotent merge
+makes harmless. The failure is safe in one direction and silent in the other.
 
 ## III. Pipeline Architecture
 
@@ -369,16 +394,40 @@ for hours. An exception raised by the callback, or a pending signal, is preserve
 re-raised rather than being flattened into a generic interruption, so the caller sees the
 real cause.
 
-### 4. Known ceiling
+### 4. Scaling out
 
-This is a single-node, single-connection design. Its throughput ceiling is one TCP
-connection to one SQL Server, and one node's cores for Parquet encoding and upload.
+One process syncs tables sequentially, which measurement says is enough for most
+workloads: several hundred unchanged tables in seconds, and rows at a few hundred thousand
+a second (see `operations.md`, Chapter IV, Section 2).
 
-The next step beyond it is syncing tables concurrently over several connections, which the
-per-table independence of the design already permits and which nothing in the current
-structure would have to be undone to add. Beyond that, partitioning a single very large
-table's watermark range across workers is possible in principle and a different
-architecture in practice.
+When it is not enough, throughput scales with workers rather than with new code.
+`tiberiusdelta.distributed` spreads the table list across Spark executors, each syncing
+its share exactly as a single process would. Nothing in the sync engine knows about it.
+
+That works because the design is shared-nothing all the way down, which was deliberate
+rather than lucky:
+
+- No cross-table transaction, so tables need no coordination.
+- One Delta table per source table, so no two workers write the same data.
+- **One checkpoint Delta table per source table**, so no two workers write the same
+  checkpoint either. This is the property that makes the rest usable: a single shared
+  checkpoint table would be one Delta table every worker had to commit to, and Delta
+  resolves that contention by failing writers. Removing the shared writer removed the need
+  to coordinate at all.
+- Idempotent merges, so Spark's own task retries are safe with no special handling.
+
+### 5. The remaining ceiling
+
+What does not scale this way is a *single* very large table, since one table is one unit of
+work. Splitting its watermark range across workers is possible, but they would then all
+merge into the same Delta table and the contention returns; the sound version stages
+Parquet per range and makes one commit, which is a different design.
+
+That is deliberately not built, because for the case it addresses, seeding a very large
+table, a bulk file export is simply better: it stops paying per-row protocol costs
+entirely, and is several times faster than any live query however parallel. The library
+supports that route directly through a checkpoint handover rather than trying to beat it;
+see Chapter II, Section 5.
 
 ## V. Resource Model
 

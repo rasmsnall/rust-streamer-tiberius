@@ -30,6 +30,8 @@ create_exception!(
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sync_tables, module)?)?;
     module.add_function(wrap_pyfunction!(preflight, module)?)?;
+    module.add_function(wrap_pyfunction!(source_watermark, module)?)?;
+    module.add_function(wrap_pyfunction!(set_checkpoint, module)?)?;
     module.add_class::<PySyncReport>()?;
     module.add_class::<PyTableSyncStats>()?;
     module.add_class::<PyTablePreflight>()?;
@@ -43,6 +45,8 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         (
             "sync_tables",
             "preflight",
+            "source_watermark",
+            "set_checkpoint",
             "SyncReport",
             "TableSyncStats",
             "TablePreflight",
@@ -347,6 +351,63 @@ fn sync_tables(
         tables,
         total_rows_fetched: report.total_rows_fetched,
     })
+}
+
+/// Builds the single-table catalog the bulk-load handover functions work on.
+fn one_table(entry: &Bound<'_, PyAny>) -> PyResult<TableSync> {
+    let catalog = build_catalog(vec![entry.clone()])?;
+    catalog
+        .tables()
+        .first()
+        .cloned()
+        .ok_or_else(|| PyValueError::new_err("a table configuration is required"))
+}
+
+#[pyfunction]
+#[pyo3(signature = (connection_string, table, *, login_timeout_sec = 30, query_timeout_sec = 300))]
+fn source_watermark(
+    py: Python<'_>,
+    connection_string: String,
+    table: &Bound<'_, PyAny>,
+    login_timeout_sec: Option<u64>,
+    query_timeout_sec: Option<u64>,
+) -> PyResult<Option<String>> {
+    let table_sync = one_table(table)?;
+    // No output is written, so output_uri is irrelevant here; a placeholder keeps
+    // SyncConfig::validate satisfied without inventing a real location.
+    let config = build_config(
+        connection_string,
+        "memory://unused".to_string(),
+        None,
+        1,
+        login_timeout_sec,
+        query_timeout_sec,
+    );
+    py.detach(|| pipeline::source_watermark(&config, &table_sync))
+        .map_err(to_pyerr)
+}
+
+#[pyfunction]
+#[pyo3(signature = (output_uri, table, last_value, *, checkpoint_uri = None))]
+fn set_checkpoint(
+    py: Python<'_>,
+    output_uri: String,
+    table: &Bound<'_, PyAny>,
+    last_value: String,
+    checkpoint_uri: Option<String>,
+) -> PyResult<()> {
+    let table_sync = one_table(table)?;
+    let config = build_config(
+        // No connection is opened, so no credential is needed to record a checkpoint.
+        String::new(),
+        output_uri,
+        checkpoint_uri,
+        1,
+        None,
+        None,
+    );
+    py.detach(|| pipeline::set_checkpoint(&config, &table_sync, &last_value))
+        .map_err(to_pyerr)
 }
 
 #[pyfunction]

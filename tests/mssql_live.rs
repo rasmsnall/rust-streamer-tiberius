@@ -349,6 +349,50 @@ fn every_mapped_type_round_trips_from_the_catalog_into_the_delta_schema() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The bulk-backfill handover, which is the whole point of `source_watermark` and
+/// `set_checkpoint`: a table too large to seed a row at a time is loaded by other means,
+/// its checkpoint is recorded, and incremental sync then fetches *nothing* rather than
+/// re-pulling everything. Getting this wrong is expensive and silent, so it is gated.
+#[test]
+fn a_recorded_checkpoint_hands_over_to_incremental_sync_without_re_pulling() {
+    let _guard = live_db();
+    let dir = tmpdir("handover");
+    let config = sync_config(uri(&dir));
+
+    // Captured before any "export", exactly as the real procedure requires.
+    let watermark = pipeline::source_watermark(&config, &customers_sync())
+        .unwrap()
+        .expect("the fixture has rows, so it has a watermark");
+
+    // No data is loaded here at all: this asserts the checkpoint alone is what stops the
+    // re-pull, so a handover that records the wrong value cannot pass by accident.
+    pipeline::set_checkpoint(&config, &customers_sync(), &watermark).unwrap();
+
+    runtime().block_on(async {
+        let stats = pipeline::sync_table(&config, &customers_sync())
+            .await
+            .expect("sync after handover should succeed");
+        assert_eq!(
+            stats.rows_fetched, 0,
+            "a recorded checkpoint must stop the whole table being re-pulled"
+        );
+    });
+
+    // And the handover must not have broken incremental sync going forward.
+    runtime().block_on(async {
+        execute(
+            "DECLARE @next DATETIME2 =                DATEADD(day, 1, (SELECT MAX(updated_at) FROM dbo.customers));              UPDATE dbo.customers SET name = N'After handover', updated_at = @next              WHERE id = 2",
+        )
+        .await;
+        let stats = pipeline::sync_table(&config, &customers_sync())
+            .await
+            .unwrap();
+        assert_eq!(stats.rows_fetched, 1, "a later change must still be seen");
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn the_checkpoint_advances_to_the_greatest_watermark_seen() {
     let _guard = live_db();

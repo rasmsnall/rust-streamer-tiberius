@@ -131,6 +131,74 @@ class TablePreflight:
 
     def __repr__(self) -> str: ...
 
+class ConcurrentWriteError(RuntimeError):
+    """Another writer committed to the same Delta table at the same time.
+
+    Delta's optimistic concurrency detected the conflict and refused the commit, so
+    nothing is corrupted and no checkpoint advanced for the affected table. Re-running is
+    safe and re-applies the same rows idempotently.
+
+    Usually means two syncs overlapped: on Databricks, set the job's maximum concurrent
+    runs to 1. Subclasses :class:`RuntimeError`, so a handler written before this type
+    existed still catches it.
+    """
+
+    table: str
+    """Qualified name of the table whose commit lost the race."""
+
+def source_watermark(
+    connection_string: str,
+    table: TableConfig,
+    *,
+    login_timeout_sec: int | None = 30,
+    query_timeout_sec: int | None = 300,
+) -> str | None:
+    """Read a table's current greatest watermark value, without syncing anything.
+
+    The first half of a bulk backfill, for a table too large to seed a row at a time. The
+    data is loaded by whatever bulk means is fastest, and this library then takes over
+    incrementally; for that handover to be correct, something has to record how far the
+    bulk load got.
+
+    .. warning::
+       **Capture this before the export starts, not after.** A watermark read afterwards
+       sits ahead of rows written while the export was running, and those rows are then
+       skipped forever. Reading it first means such rows are merely re-fetched by the
+       first incremental run, which is harmless because the merge is idempotent.
+
+    :returns: The watermark rendered exactly as a checkpoint records it, or ``None`` if
+        the table is empty, in which case an ordinary first sync is the right thing.
+
+    :raises ConnectionError: The source could not be reached.
+    :raises ValueError: The configuration is wrong, or the watermark column does not
+        exist.
+    """
+
+def set_checkpoint(
+    output_uri: str,
+    table: TableConfig,
+    last_value: str,
+    *,
+    checkpoint_uri: str | None = None,
+) -> None:
+    """Record how far a table has been synced, without syncing anything.
+
+    The second half of a bulk backfill: once the data is in the table's Delta table by
+    whatever means, this hands over to incremental sync, which then fetches only what has
+    changed since ``last_value``. Opens no connection to the source.
+
+    :param last_value: What :func:`source_watermark` returned **before** the export ran.
+
+    .. warning::
+       This records a checkpoint for data it has not verified, which is the point and
+       also the risk. A value ahead of what was actually loaded silently skips the rows in
+       between and nothing will report it; a value behind is safe, costing only a
+       re-fetch. When unsure, choose the earlier value.
+
+    :raises ValueError: The configuration is wrong, or a name is unsafe to use in a path.
+    :raises RuntimeError: The checkpoint could not be written.
+    """
+
 def sync_tables(
     connection_string: str,
     output_uri: str,

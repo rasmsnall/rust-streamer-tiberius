@@ -757,6 +757,148 @@ pub fn preflight(config: &SyncConfig, catalog: &SyncCatalog) -> Result<Vec<Table
     })
 }
 
+/// Reads a table's current greatest watermark value from the source, without syncing.
+///
+/// The first half of a bulk backfill. When a table is too large to seed through this
+/// library's own row-by-row path, it is loaded by other means (a `bcp` export read with
+/// Spark, for instance) and this library then takes over incrementally. For that handover
+/// to be correct, something has to record how far the bulk load got, and this is how that
+/// value is obtained.
+///
+/// **Capture this before the export starts, not after.** A watermark read after the
+/// export would sit ahead of rows written while the export was running, and those rows
+/// would then be skipped forever by the strictly-greater-than filter. Reading it first
+/// means any row written during the export is simply re-fetched by the first incremental
+/// run, which is harmless because the merge is idempotent. Conservative in the safe
+/// direction, and see `docs/operations.md` for the full procedure.
+///
+/// Rendered exactly as [`sync_table`] would record it, through the same function, so the
+/// value is comparable with one this crate wrote itself.
+///
+/// Returns `None` if the table is empty, in which case there is no watermark to record
+/// and an ordinary first sync is the right thing.
+///
+/// # Errors
+///
+/// [`Error::Connect`] or [`Error::Query`] for a connection or query failure,
+/// [`Error::UnsafeTableName`] for a name unsafe to interpolate, and
+/// [`Error::ColumnNotFound`] if the configured watermark column does not exist.
+///
+/// # Panics
+///
+/// Does not panic.
+///
+/// # Blocking
+///
+/// Blocks the calling thread, driving its own private Tokio runtime, so it must not be
+/// called from inside an existing runtime.
+pub fn source_watermark(config: &SyncConfig, table_sync: &TableSync) -> Result<Option<String>> {
+    table_sync.validate()?;
+    validate_identifier(&table_sync.watermark_column)?;
+    let parsed = parse_qualified(&table_sync.table)?;
+    let _ = parsed;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Io {
+            message: e.to_string(),
+        })?;
+
+    runtime.block_on(async {
+        let mut client = connect::open(&config.connect).await?;
+        let columns = with_timeout(
+            config.query_timeout_sec,
+            "the catalog lookup",
+            describe_table(&mut client, config, &table_sync.table),
+        )
+        .await
+        .map_err(|e| e.in_table(&table_sync.table))?;
+        if !columns
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(&table_sync.watermark_column))
+        {
+            return Err(Error::ColumnNotFound {
+                table: table_sync.table.clone(),
+                column: table_sync.watermark_column.clone(),
+                role: "watermark column",
+            });
+        }
+
+        let sql = format!(
+            "SELECT MAX({}) FROM {}",
+            table_sync.watermark_column, table_sync.table
+        );
+        let row = client
+            .query(sql, &[])
+            .await
+            .map_err(|e| connect::query_error(&e, &config.connect.connection_string))?
+            .into_row()
+            .await
+            .map_err(|e| connect::query_error(&e, &config.connect.connection_string))?;
+
+        Ok(row.and_then(|row| {
+            row.cells()
+                .next()
+                .and_then(|(_, d)| builders::render_text(d))
+        }))
+    })
+}
+
+/// Records that `table_sync` has been synced up to `last_value`, without syncing anything.
+///
+/// The second half of a bulk backfill: once the data is in the table's Delta table by
+/// whatever means, this hands over to incremental sync, which then fetches only what has
+/// changed since `last_value` rather than re-pulling everything.
+///
+/// `last_value` should be what [`source_watermark`] returned **before** the export ran.
+///
+/// This writes a checkpoint for data it has not itself verified, which is the whole point
+/// and also the risk: a value ahead of what was actually loaded silently skips the rows in
+/// between, and nothing will report it. A value behind is safe, costing only a re-fetch.
+/// When unsure, choose the earlier value.
+///
+/// # Errors
+///
+/// [`Error::UnsafeTableName`] for a name unsafe to use in a path, and
+/// [`Error::Checkpoint`] or [`Error::Delta`] if the checkpoint could not be written.
+///
+/// # Panics
+///
+/// Does not panic.
+///
+/// # Blocking
+///
+/// Blocks the calling thread, driving its own private Tokio runtime, so it must not be
+/// called from inside an existing runtime.
+pub fn set_checkpoint(config: &SyncConfig, table_sync: &TableSync, last_value: &str) -> Result<()> {
+    table_sync.validate()?;
+    let at = checkpoint_uri_for(config, &table_sync.table)?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::Io {
+            message: e.to_string(),
+        })?;
+
+    runtime.block_on(async {
+        let synced_at_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        checkpoint::advance(
+            &at,
+            &table_sync.table,
+            &table_sync.watermark_column,
+            last_value,
+            synced_at_micros,
+        )
+        .await
+        .map_err(|e| e.in_table(&table_sync.table))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -68,8 +68,41 @@ that may already have been applied, and because the merge is an upsert, re-apply
 updates in place rather than duplicating. Checkpoint-first would permanently skip rows that
 were never merged.
 
-Checkpoints live in a `_streamer_checkpoints` Delta table beneath the output prefix, one
-row per source table.
+Each table gets **its own** checkpoint Delta table, at
+`_streamer_checkpoints/<schema>/<table>`, mirroring the data layout. One shared checkpoint
+table would be a single Delta table every sync must commit to, which is exactly what stops
+you adding workers; see Scaling.
+
+## Scaling
+
+One worker syncs several hundred unchanged tables in seconds, and moves rows at roughly
+half a million a second, so a single node covers most workloads. Measured numbers are in
+`docs/operations.md`, Chapter IV, Section 2.
+
+When it is not enough, **throughput scales with workers, not with new code**:
+
+```python
+from tiberiusdelta.distributed import sync_tables_distributed
+report = sync_tables_distributed(connection_string, OUTPUT, TABLES)
+```
+
+Every table is independent all the way down: its own Delta table, its own checkpoint Delta
+table, no cross-table transaction, no shared writer. Two workers never write the same Delta
+table, so adding executors adds throughput and nothing needs coordinating. Spark's own task
+retries are safe, because a sync is idempotent.
+
+The exception is seeding one very large table for the first time, where the answer is a
+bulk export rather than more workers. Capture the watermark, load the table by whatever
+bulk means is fastest, record the checkpoint, and incremental sync takes over:
+
+```python
+watermark = tiberiusdelta.source_watermark(connection_string, TABLE)  # before exporting
+# ... bcp out, read with Spark, write the Delta table ...
+tiberiusdelta.set_checkpoint(OUTPUT, TABLE, watermark)
+```
+
+Capture it *before* the export, never after: read afterwards it sits ahead of rows written
+during the export and those rows are skipped permanently.
 
 ## What it will not do
 
