@@ -1,15 +1,14 @@
-//! End-to-end tests against a local throwaway Firebird container (see `CLAUDE.md`'s
-//! Environment notes for how to start one and seed it).
+//! End-to-end tests against a local throwaway Firebird container, or the
+//! `firebirddelta-ci.yml` service container in CI (see `CLAUDE.md`'s Environment notes
+//! for how to start one locally and seed it).
 //!
-//! **Not run in this crate's own history yet.** Unlike the sibling `tiberiusdelta`
-//! crate, whose equivalent `tests/mssql_live.rs` has been run against a real SQL Server
-//! container repeatedly, this file was written without access to a live Firebird
-//! instance (no container runtime was available in the session that wrote it; see
-//! `CLAUDE.md`'s Open items). Treat it as a design for what the live gate should check,
-//! not as a passed gate: run it once against a real instance before trusting it, the
-//! same way `.devtest/type_zoo.sql`'s own header asks for its literal syntax.
-//!
-//! Not part of a CI gate yet, for the same reason: there is no Firebird service in CI.
+//! **Not run against a real server in this crate's own history yet**, even though a CI
+//! job now exists to run it: the session that wrote this file (and the
+//! `firebirdsql/firebird` image, connection details, and CI workflow it now depends on)
+//! had no Docker daemon available to actually execute it even once. Treat it as a
+//! carefully-researched design for what the live gate should check, not as a passed
+//! gate, until its first real CI run confirms the image, the credentials, and
+//! `.devtest/type_zoo.sql`'s literal syntax all actually agree with each other.
 
 use std::sync::Mutex;
 
@@ -19,8 +18,13 @@ use firebirddelta::catalog::TableSync;
 use firebirddelta::connect::ConnectConfig;
 use firebirddelta::pipeline::{self, SyncConfig};
 
-const CONNECTION_STRING: &str =
-    "firebird://SYSDBA:masterkey@127.0.0.1:3050//firebird/data/firebirddelta_test.fdb";
+/// Matches `firebirddelta-test-firebird`'s `FIREBIRD_ROOT_PASSWORD` in `CLAUDE.md`'s
+/// Environment notes, and `firebird-ci.env.FIREBIRD_PASSWORD` in
+/// `.github/workflows/firebirddelta-ci.yml`. `/var/lib/firebird/data/` is the official
+/// `firebirdsql/firebird` image's own database directory (its `FIREBIRD_DATABASE`
+/// environment variable creates the file there, and nowhere else is documented).
+const CONNECTION_STRING: &str = "firebird://SYSDBA:Test_Passw0rd!2026@127.0.0.1:3050/\
+     /var/lib/firebird/data/firebirddelta_test.fdb";
 
 /// All tests in this file read, and some write, the *same* live `CUSTOMERS` table, even
 /// though each uses its own local Delta output directory. `cargo test` runs tests in

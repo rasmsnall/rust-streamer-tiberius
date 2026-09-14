@@ -15,10 +15,12 @@ Usage::
 
     python tools/seed.py [host] [port] [path/to/test.fdb]
 
-Defaults to ``127.0.0.1:3050`` and ``/firebird/data/firebirddelta_test.fdb``, matching a
-local throwaway container (see ``CLAUDE.md``'s Environment notes). Reads the password
-from ``FIREBIRD_PASSWORD`` (falling back to Firebird's own default ``masterkey``, which
-is only appropriate for a throwaway local instance, never a real one).
+Defaults to ``127.0.0.1:3050`` and ``/var/lib/firebird/data/firebirddelta_test.fdb``,
+matching the official ``firebirdsql/firebird`` image's own database directory and the
+``FIREBIRD_DATABASE=firebirddelta_test.fdb`` this crate's local throwaway container and
+CI both set (see ``CLAUDE.md``'s Environment notes). Reads the password from
+``FIREBIRD_PASSWORD``, which must match whatever the container's own
+``FIREBIRD_ROOT_PASSWORD`` was set to; there is no safe default to fall back to.
 """
 
 from __future__ import annotations
@@ -60,8 +62,12 @@ def statements(script: str) -> list[str]:
 def main() -> int:
     host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 3050
-    db_path = sys.argv[3] if len(sys.argv) > 3 else "/firebird/data/firebirddelta_test.fdb"
-    password = os.environ.get("FIREBIRD_PASSWORD", "masterkey")
+    db_path = (
+        sys.argv[3] if len(sys.argv) > 3 else "/var/lib/firebird/data/firebirddelta_test.fdb"
+    )
+    password = os.environ.get("FIREBIRD_PASSWORD")
+    if not password:
+        raise SystemExit("set FIREBIRD_PASSWORD to the instance's SYSDBA password")
 
     dsn = f"{host}/{port}:{db_path}"
     connection = fdb.connect(dsn, user="SYSDBA", password=password)

@@ -430,6 +430,18 @@ Firebird's own reference documentation for `RDB$FIELDS`)
   not normalise casing itself (matching every other sibling's "no guessing" policy) and
   matches column names case-insensitively for convenience, the same leniency
   tiberiusdelta applies.
+- **An absolute database path in the connection URL needs a *double* slash after the
+  port, not one.** `rsfbclient`'s own `conn_string::parse` strips exactly one leading
+  slash off the URL path component whenever a host is present, so that a *relative*
+  `db_name` (`firebird://host:3050/mydb.fdb`) round-trips as `mydb.fdb`, not `/mydb.fdb`.
+  An absolute path therefore needs the extra slash restored:
+  `firebird://host:3050//var/lib/firebird/data/mydb.fdb`. Confirmed against
+  `rsfbclient`'s own `conn_string.rs` test suite, which uses exactly this doubled form
+  for every absolute-path example it tests; every connection string in this crate's own
+  fixtures and tooling that names an absolute path follows it (`tests/firebird_live.rs`,
+  `tools/smoke.py`). A relative name (a Firebird database alias, or a bare filename
+  Firebird resolves against its own default directory) needs only one slash, the
+  ordinary case shown everywhere else in this document.
 
 ## Scaling
 
@@ -484,9 +496,13 @@ Still open, each needing a decision or a fact before it can be finalized:
   native `INT128`/`DECFLOAT` ever becomes a real requirement.** See "Why `rsfbclient`"
   above for what would have to change and what it would cost (the driver install this
   crate currently avoids).
-- **No CI Firebird service container has been set up.** Unlike tiberiusdelta's CI, which
-  runs a SQL Server service container for its own live suite and smoke test, this
-  crate's live gate is not wired into any CI at all yet.
+- **`.github/workflows/firebirddelta-ci.yml` exists but has not yet had a first run
+  confirm it actually works.** It mirrors tiberiusdelta's own CI shape (`check`, `live`,
+  `wheel`, `interpreters` jobs) against a `firebirdsql/firebird` service container, built
+  and pushed without a Docker daemon available to rehearse it locally first (see below).
+  Its first real run is the actual verification this crate's live suite has been
+  missing; treat a green run of it, not this document, as the point this crate reaches
+  parity with tiberiusdelta's own "run against a real server" status.
 
 ## Environment notes
 
@@ -494,22 +510,27 @@ Still open, each needing a decision or a fact before it can be finalized:
 - **This session had no Docker daemon available** (`docker` the client binary was
   present, but `dockerd` was not running, and no Firebird instance was reachable any
   other way), unlike tiberiusdelta's own development environment, which has a running
-  local SQL Server container. The Firebird equivalent this crate's fixtures and tests
-  are written against, once such an environment exists, is a throwaway container running
-  **Firebird 4.0 or later** (`.devtest/type_zoo.sql` needs Firebird 4 for `INT128`,
-  `DECFLOAT`, and the `WITH TIME ZONE` types; earlier Firebird versions would need a
-  narrower type-zoo fixture), for example:
+  local SQL Server container. `.github/workflows/firebirddelta-ci.yml` is this crate's
+  first actual chance to run against a real server, once it runs in GitHub Actions.
+  The Firebird equivalent this crate's fixtures, tests, and CI workflow are written
+  against is a throwaway instance running **Firebird 5.0** (the current stable series;
+  `.devtest/type_zoo.sql` needs Firebird 4.0 or later for `INT128`, `DECFLOAT`, and the
+  `WITH TIME ZONE` types, and 5.0 is the newest series that has them), using the
+  official `firebirdsql/firebird` image (`jacobalberty/firebird`, mentioned in earlier
+  drafts of this document, is archived upstream in favour of this one), for example:
 
   ```bash
   docker run -d --name firebirddelta-test-firebird -p 3050:3050 \
     -e FIREBIRD_DATABASE=firebirddelta_test.fdb \
-    -e ISC_PASSWORD=masterkey \
-    -e FIREBIRD_USER=SYSDBA \
-    jacobalberty/firebird:v4.0
+    -e FIREBIRD_ROOT_PASSWORD='Test_Passw0rd!2026' \
+    firebirdsql/firebird:5.0.4
   ```
 
-  paired with `python tools/seed.py` (needs `pip install firebird-driver`, the official
-  Python client, which itself needs the native `fbclient` library present on whatever
+  which creates the database at `/var/lib/firebird/data/firebirddelta_test.fdb` inside
+  the container (that fixed directory, not a configurable one, per the image's own
+  documentation), paired with `python tools/seed.py` (needs `pip install
+  firebird-driver`, the official Python client, which itself needs the native `fbclient`
+  library present on whatever
   machine runs the *tooling* — a cost this crate's own shipped Rust/Python surface does
   not carry, since that uses `rsfbclient`'s driver-free `pure_rust` backend instead) and
   then `cargo test --test firebird_live`.

@@ -8,7 +8,7 @@ exactly the one row that changed. Reads the committed Delta table back with the
 raised. Mirrors tiberiusdelta's own ``tools/smoke.py`` step for step.
 
 Expects ``tools/seed.py`` to have run first. Reads the password from
-``FIREBIRD_PASSWORD`` (default ``masterkey``).
+``FIREBIRD_PASSWORD``, which must match the container's own ``FIREBIRD_ROOT_PASSWORD``.
 
 Usage::
 
@@ -69,11 +69,21 @@ def main() -> int:
     global DSN, PASSWORD
     host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
     port = sys.argv[2] if len(sys.argv) > 2 else "3050"
-    db_path = sys.argv[3] if len(sys.argv) > 3 else "/firebird/data/firebirddelta_test.fdb"
-    PASSWORD = os.environ.get("FIREBIRD_PASSWORD", "masterkey")
+    db_path = (
+        sys.argv[3] if len(sys.argv) > 3 else "/var/lib/firebird/data/firebirddelta_test.fdb"
+    )
+    PASSWORD = os.environ.get("FIREBIRD_PASSWORD")
+    if not PASSWORD:
+        raise SystemExit("set FIREBIRD_PASSWORD to the instance's SYSDBA password")
     DSN = f"{host}/{port}:{db_path}"
 
-    connection_string = f"firebird://SYSDBA:{PASSWORD}@{host}:{port}{db_path}"
+    # Two slashes before an absolute path, not one: rsfbclient's URL parser strips
+    # exactly one leading slash off the URL path component when a host is present (so a
+    # *relative* db_name round-trips correctly), which would otherwise turn
+    # "/var/lib/..." into the relative, wrong "var/lib/...". See tests/firebird_live.rs's
+    # own CONNECTION_STRING for the same footgun, and rsfbclient's own conn_string.rs
+    # tests, which use exactly this double-slash form for every absolute-path example.
+    connection_string = f"firebird://SYSDBA:{PASSWORD}@{host}:{port}/{db_path}"
 
     output = tempfile.mkdtemp(prefix="firebirddelta-smoke-")
     output_uri = "file://" + output.replace("\\", "/")

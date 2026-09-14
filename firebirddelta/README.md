@@ -119,18 +119,26 @@ The end-to-end tests need a Firebird instance (untested in this session; see
 
 ```bash
 docker run -d --name firebirddelta-test-firebird -p 3050:3050 \
-  -e FIREBIRD_DATABASE=firebirddelta_test.fdb -e ISC_PASSWORD=masterkey \
-  jacobalberty/firebird:v4.0
+  -e FIREBIRD_DATABASE=firebirddelta_test.fdb \
+  -e FIREBIRD_ROOT_PASSWORD='Test_Passw0rd!2026' \
+  firebirdsql/firebird:5.0.4
 
+export FIREBIRD_PASSWORD='Test_Passw0rd!2026'
 pip install firebird-driver
 python tools/seed.py
 cargo test --test firebird_live
 ```
 
+`.github/workflows/firebirddelta-ci.yml` runs the same steps in CI, plus builds and
+smoke-tests the wheel.
+
 ## Status
 
-Compiles and passes every gate that does not need a live server. **Not yet run against
-any Firebird instance, live or local.** See `CLAUDE.md`'s Status and Open items.
+Compiles and passes every gate that does not need a live server. **Not yet confirmed to
+work against any Firebird instance**, live or local, by this session's own hand — no
+Docker daemon was available to run it here. `.github/workflows/firebirddelta-ci.yml`
+exists to close that gap the first time it runs; see `CLAUDE.md`'s Status and Open
+items for what "not yet confirmed" covers precisely.
 
 ## License
 
