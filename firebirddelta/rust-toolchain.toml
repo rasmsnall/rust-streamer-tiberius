@@ -1,0 +1,7 @@
+# Pinned so that rustfmt and clippy give the same verdict locally and in CI. Both tools
+# change their output between releases, and a formatting gate that disagrees with the
+# developer's machine is worse than no gate. Matches the parent repo's tiberiusdelta
+# crate and pgdelta.
+[toolchain]
+channel = "1.94.0"
+components = ["rustfmt", "clippy"]

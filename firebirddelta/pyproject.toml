@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "firebirddelta"
+version = "0.1.0"
+description = "Stream a live Firebird database incrementally into Delta Lake tables"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database",
+]
+
+[project.urls]
+Source = "https://github.com/rasmsnall/rust-streamer-tiberius"
+
+[tool.maturin]
+# The extension-module feature is off in Cargo.toml's default set so `cargo test` links
+# libpython; the wheel build turns it on here. abi3 comes from the always-on pyo3 feature.
+features = ["extension-module"]
+module-name = "firebirddelta._firebirddelta"
+python-source = "python"
+strip = true
